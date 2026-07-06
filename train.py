@@ -6,12 +6,15 @@ CLI entry point for training any benchmark temporal model.
 
 Available models
 ----------------
-    pi_lstm          PI-LSTM, 23 process features only
-    neural_ode       Neural ODE, 23 process features only
-    cdae_pi_lstm     PI-LSTM, 23 process feats + 64 CDAE Raman latents
-    cvae_pi_lstm     PI-LSTM, 23 process feats + 64 CVAE Raman latents
-    pca_pi_lstm      PI-LSTM, 23 process feats +  4 PCA Raman latents
-    pls_pi_lstm      PI-LSTM, 23 process feats +  4 PLS Raman latents
+    pi_lstm               PI-LSTM, 23 process features only (2-head)
+    neural_ode            Neural ODE, 23 process features only
+    cdae_pi_lstm          PI-LSTM, 64 CDAE Raman latents (pen-only)
+    cvae_pi_lstm          PI-LSTM, 64 CVAE Raman latents (pen-only)
+    pca_pi_lstm           PI-LSTM,  4 PCA  Raman latents (pen-only)
+    pls_pi_lstm           PI-LSTM,  4 PLS  Raman latents (pen-only)
+    cdae_process_pi_lstm  PI-LSTM, 64 CDAE latents + 23 process vars (pen-only)
+    delta_cdae_pi_lstm    PI-LSTM, 64 CDAE latents, ΔP head (pen-only, ablation)
+    process_pi_lstm       PI-LSTM, 23 process features only (pen-only, no Raman)
 
 Usage
 -----
@@ -50,10 +53,52 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# ── Regime-ablation split helpers ─────────────────────────────────────────────
+# Batch IDs are 0-indexed in _batch_id (batch 1 == id 0, batch 30 == id 29).
+
+_REGIME_1_IDS = set(range(0,  30))   # batches  1-30  recipe-driven
+_REGIME_2_IDS = set(range(30, 60))   # batches 31-60  operator-controlled
+_REGIME_3_IDS = set(range(60, 90))   # batches 61-90  APC closed-loop
+
+
+def _regime_ablation_splits(dm, seed: int = 42):
+    """
+    Leave-One-Regime-Out split (Regime 2 held out as test):
+
+      Train / Val  →  Regime 1 (batches 1-30, recipe-driven), 80/20 random
+      Test         →  Regime 2 (batches 31-60, operator-controlled)
+
+    Faulty batches (91-100) are excluded; they remain available via
+    dm.batches_fault if needed separately.
+    """
+    regime1 = [
+        b for b in dm.batches_clean
+        if b["_batch_id"].iloc[0] in _REGIME_1_IDS
+    ]
+    regime2 = [
+        b for b in dm.batches_clean
+        if b["_batch_id"].iloc[0] in _REGIME_2_IDS
+    ]
+
+    rng     = np.random.default_rng(seed)
+    perm    = rng.permutation(len(regime1))
+    n_train = int(len(regime1) * 0.80)
+    train_b = [regime1[i] for i in perm[:n_train]]
+    val_b   = [regime1[i] for i in perm[n_train:]]
+    test_b  = regime2
+
+    print(
+        f"  [regime-ablation]  Train: {len(train_b)} (Regime 1 80%)  |  "
+        f"Val: {len(val_b)} (Regime 1 20%)  |  "
+        f"Test: {len(test_b)} (Regime 2, operator-controlled)"
+    )
+    return train_b, val_b, test_b
+
+
 MODEL_NAMES = [
     "pi_lstm", "neural_ode",
     "cdae_pi_lstm", "cvae_pi_lstm", "pca_pi_lstm", "pls_pi_lstm",
-    "delta_cdae_pi_lstm", "cdae_process_pi_lstm",
+    "delta_cdae_pi_lstm", "cdae_process_pi_lstm", "process_pi_lstm",
 ]
 
 
@@ -122,12 +167,12 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(
                 f"PCA encoder checkpoint not found: {ckpt_path}\n"
-                "Run `python pca_baseline.py` first to fit and save the PCA encoder."
+                "Run `python scripts/pca_baseline.py` first to fit and save the PCA encoder."
             )
         if not Path(scaler_path).exists():
             raise FileNotFoundError(
                 f"PCA scaler not found: {scaler_path}\n"
-                "Run `python pca_baseline.py` first to fit and save the PCA scaler."
+                "Run `python scripts/pca_baseline.py` first to fit and save the PCA scaler."
             )
         n_components = int(cfg.data.get("raman_latent_dim", 4))
         from src.data.pca_encoder import PCARamanEncoderV1
@@ -147,12 +192,12 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(
                 f"PLS encoder checkpoint not found: {ckpt_path}\n"
-                "Run `python pls_baseline.py` first to fit and save the PLS encoder."
+                "Run `python scripts/pls_baseline.py` first to fit and save the PLS encoder."
             )
         if not Path(scaler_path).exists():
             raise FileNotFoundError(
                 f"PLS scaler not found: {scaler_path}\n"
-                "Run `python pls_baseline.py` first to fit and save the PLS scaler."
+                "Run `python scripts/pls_baseline.py` first to fit and save the PLS scaler."
             )
         n_components = int(cfg.data.get("raman_latent_dim", 4))
         from src.data.pls_encoder import PLSRamanEncoderV1
@@ -203,6 +248,14 @@ def main() -> None:
         "--no-plots", action="store_true",
         help="Skip saving prediction / history plots.",
     )
+    parser.add_argument(
+        "--regime-ablation", action="store_true", dest="regime_ablation",
+        help=(
+            "Leave-One-Regime-Out split: train/val on batches 1-30 (recipe), "
+            "test on batches 31-60 (operator). "
+            "Overrides the train_frac / split_strategy from config."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -238,17 +291,20 @@ def main() -> None:
     dm = PenicillinDataModule(cfg.data, raman_encoder=raman_encoder)
     dm.load()
 
-    strategy   = cfg.data.get("split_strategy", "random")
-    train_frac = float(cfg.data.get("train_frac", 0.80))
-    train_b, val_b, test_b = dm.get_splits(
-        train_frac=train_frac,
-        seed=seed,
-        strategy=strategy,
-    )
-    print(
-        f"  Train: {len(train_b)}  |  Val: {len(val_b)}  |  "
-        f"Test (faulty): {len(test_b)}"
-    )
+    if args.regime_ablation:
+        train_b, val_b, test_b = _regime_ablation_splits(dm, seed=seed)
+    else:
+        strategy   = cfg.data.get("split_strategy", "random")
+        train_frac = float(cfg.data.get("train_frac", 0.80))
+        train_b, val_b, test_b = dm.get_splits(
+            train_frac=train_frac,
+            seed=seed,
+            strategy=strategy,
+        )
+        print(
+            f"  Train: {len(train_b)}  |  Val: {len(val_b)}  |  "
+            f"Test (faulty): {len(test_b)}"
+        )
 
     # ── Algorithm ────────────────────────────────────────────────────────────
     print(f"\n[2] Initialising algorithm '{args.model}' ...")

@@ -17,6 +17,7 @@ from src.algorithms.pca_pi_lstm       import PCAPILSTMAlgorithm          # noqa:
 from src.algorithms.pls_pi_lstm       import PLSPILSTMAlgorithm          # noqa: F401
 from src.algorithms.delta_cdae_pi_lstm   import DeltaCDAEPILSTMAlgorithm    # noqa: F401
 from src.algorithms.cdae_process_pi_lstm import CDAEProcessPILSTMAlgorithm  # noqa: F401
+from src.algorithms.process_pi_lstm      import ProcessPILSTMAlgorithm      # noqa: F401
 
 
 def get_algorithm(name: str) -> type:
@@ -29,7 +30,8 @@ def get_algorithm(name: str) -> type:
         One of: ``"pi_lstm"``, ``"neural_ode"``,
         ``"cdae_pi_lstm"``, ``"cvae_pi_lstm"``,
         ``"pca_pi_lstm"``, ``"pls_pi_lstm"``,
-        ``"delta_cdae_pi_lstm"``, ``"cdae_process_pi_lstm"``.
+        ``"delta_cdae_pi_lstm"``, ``"cdae_process_pi_lstm"``,
+        ``"process_pi_lstm"``.
 
     Raises
     ------
@@ -55,5 +57,6 @@ __all__ = [
     "PLSPILSTMAlgorithm",
     "DeltaCDAEPILSTMAlgorithm",
     "CDAEProcessPILSTMAlgorithm",
+    "ProcessPILSTMAlgorithm",
     "get_algorithm",
 ]

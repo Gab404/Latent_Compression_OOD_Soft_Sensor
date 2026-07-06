@@ -31,10 +31,54 @@ import torch
 warnings.filterwarnings("ignore")
 
 
+# ── Regime-ablation split helpers ─────────────────────────────────────────────
+# Batch IDs are 0-indexed in _batch_id (batch 1 == id 0, batch 30 == id 29).
+
+_REGIME_1_IDS = set(range(0,  30))   # batches  1-30  recipe-driven
+_REGIME_2_IDS = set(range(30, 60))   # batches 31-60  operator-controlled
+_REGIME_3_IDS = set(range(60, 90))   # batches 61-90  APC closed-loop
+
+
+def _regime_ablation_splits(dm, seed: int = 42):
+    """
+    Leave-One-Regime-Out split (Regime 2 held out as test):
+
+      Train / Val  →  Regime 1 (batches 1-30, recipe-driven), 80/20 random
+      Test         →  Regime 2 (batches 31-60, operator-controlled)
+
+    Faulty batches (91-100) are excluded; they remain available via
+    dm.batches_fault if needed separately.
+    """
+    import numpy as np
+
+    regime1 = [
+        b for b in dm.batches_clean
+        if b["_batch_id"].iloc[0] in _REGIME_1_IDS
+    ]
+    regime2 = [
+        b for b in dm.batches_clean
+        if b["_batch_id"].iloc[0] in _REGIME_2_IDS
+    ]
+
+    rng     = np.random.default_rng(seed)
+    perm    = rng.permutation(len(regime1))
+    n_train = int(len(regime1) * 0.80)
+    train_b = [regime1[i] for i in perm[:n_train]]
+    val_b   = [regime1[i] for i in perm[n_train:]]
+    test_b  = regime2
+
+    print(
+        f"  [regime-ablation]  Train: {len(train_b)} (Regime 1 80%)  |  "
+        f"Val: {len(val_b)} (Regime 1 20%)  |  "
+        f"Test: {len(test_b)} (Regime 2, operator-controlled)"
+    )
+    return train_b, val_b, test_b
+
+
 ALL_MODELS = [
     "pi_lstm", "neural_ode",
     "cdae_pi_lstm", "cvae_pi_lstm", "pca_pi_lstm", "pls_pi_lstm",
-    "delta_cdae_pi_lstm", "cdae_process_pi_lstm",
+    "delta_cdae_pi_lstm", "cdae_process_pi_lstm", "process_pi_lstm",
 ]
 
 DEFAULT_CKPTS = {
@@ -46,6 +90,7 @@ DEFAULT_CKPTS = {
     "pls_pi_lstm":            "./checkpoints/pls_pi_lstm.pt",
     "delta_cdae_pi_lstm":     "./checkpoints/delta_cdae_pi_lstm.pt",
     "cdae_process_pi_lstm":   "./checkpoints/cdae_process_pi_lstm.pt",
+    "process_pi_lstm":        "./checkpoints/process_pi_lstm.pt",
 }
 
 
@@ -99,7 +144,7 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(
                 f"PCA encoder checkpoint not found: {ckpt_path}\n"
-                "Run `python pca_baseline.py` first to fit and save the PCA encoder."
+                "Run `python scripts/pca_baseline.py` first to fit and save the PCA encoder."
             )
         if not Path(scaler_path).exists():
             raise FileNotFoundError(f"PCA scaler not found: {scaler_path}")
@@ -121,7 +166,7 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(
                 f"PLS encoder checkpoint not found: {ckpt_path}\n"
-                "Run `python pls_baseline.py` first to fit and save the PLS encoder."
+                "Run `python scripts/pls_baseline.py` first to fit and save the PLS encoder."
             )
         if not Path(scaler_path).exists():
             raise FileNotFoundError(f"PLS scaler not found: {scaler_path}")
@@ -161,7 +206,7 @@ def _patch_portable_paths(cfg) -> None:
         cfg.data["csv_path"] = _DEFAULT_CSV
 
 
-def _load_data(cfg, device: torch.device):
+def _load_data(cfg, device: torch.device, regime_ablation: bool = False):
     """Return ``(train_b, val_b, test_b)`` using the split stored in cfg."""
     import random
     import numpy as np
@@ -177,6 +222,9 @@ def _load_data(cfg, device: torch.device):
     dm = PenicillinDataModule(cfg.data, raman_encoder=raman_enc)
     dm.load()
 
+    if regime_ablation:
+        return _regime_ablation_splits(dm, seed=seed)
+
     strategy   = cfg.data.get("split_strategy", "random")
     train_frac = float(cfg.data.get("train_frac", 0.80))
     return dm.get_splits(train_frac=train_frac, seed=seed, strategy=strategy)
@@ -187,6 +235,7 @@ def _evaluate_one(
     ckpt_path:  str,
     device:     torch.device,
     save_plots: bool = False,
+    regime_ablation: bool = False,
 ) -> Optional[Dict]:
     """Load checkpoint, reload data, run ``evaluate()`` on val + test splits."""
     if not Path(ckpt_path).exists():
@@ -202,15 +251,18 @@ def _evaluate_one(
     alg = BaseAlgorithm.load(ckpt_path, device)
     cfg = alg.cfg
 
-    _, val_b, test_b = _load_data(cfg, device)
+    _, val_b, test_b = _load_data(cfg, device, regime_ablation=regime_ablation)
 
     from src.evaluation.metrics import print_metrics_table
 
-    print("  Val (fault-free):")
+    val_label  = "Val (Regime 1 holdout):" if regime_ablation else "Val (fault-free):"
+    test_label = "Test (Regime 2, operator):" if regime_ablation else "Test (faulty):"
+
+    print(f"  {val_label}")
     val_m = alg.evaluate(val_b)
     print_metrics_table(val_m, label="Val")
 
-    print("  Test (faulty):")
+    print(f"  {test_label}")
     test_m = alg.evaluate(test_b)
     print_metrics_table(test_m, label="Test")
 
@@ -294,6 +346,14 @@ def main() -> None:
         "--scatter", default=None,
         help="Path to save a scatter comparison PNG (all models).",
     )
+    parser.add_argument(
+        "--regime-ablation", action="store_true", dest="regime_ablation",
+        help=(
+            "Leave-One-Regime-Out evaluation: val on Regime 1 holdout "
+            "(batches 1-30), test on Regime 2 (batches 31-60, operator-controlled). "
+            "Overrides the default fault-free val / faulty test split."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device(
@@ -313,7 +373,11 @@ def main() -> None:
         else:
             ckpt_path = DEFAULT_CKPTS[model_name]
 
-        res = _evaluate_one(model_name, ckpt_path, device, save_plots=args.plots)
+        res = _evaluate_one(
+            model_name, ckpt_path, device,
+            save_plots=args.plots,
+            regime_ablation=args.regime_ablation,
+        )
         all_results[model_name] = res
         if res is not None and args.scatter:
             scatter_inputs[model_name] = {

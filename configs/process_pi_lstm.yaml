@@ -1,0 +1,65 @@
+# configs/process_pi_lstm.yaml
+# ==============================
+# Process-PI-LSTM: Physics-Informed LSTM driven exclusively by the 23 process
+# state variables (temperature, pH, dissolved O2, substrate concentration,
+# aeration rate, feed rates, vessel volume, off-gas composition, OUR, CER …).
+# No Raman spectra, no encoder.
+#
+# Input : 23-dim process feature vector → MinMaxScaler → LSTM
+# Model : CDAEPILSTMModel(input_size=23)
+#           2-layer LSTM(23→64) + FC(32) + penicillin head (Sigmoid)
+#           + rate head (linear) → physics loss ΔP ≈ k_prod·r_net·dt
+#
+# Benchmark role
+# --------------
+#   Direct comparator to cdae_pi_lstm (Raman only) and
+#   cdae_process_pi_lstm (Raman + process) — isolates the contribution of
+#   process state variables to penicillin prediction.
+#
+# Benchmark split: random seed=42, 72 train / 18 FF-val / 10 fault-test
+# Evaluation metric: sparse offline measurement points only (≈20/batch)
+
+name: process_pi_lstm
+
+data:
+  csv_path:         ./100_Batches_IndPenSim_V3.csv
+  use_raman:        false      # no Raman encoding
+
+  split_strategy:   random
+  train_frac:       0.80
+  seed:             42
+  min_len:          50
+
+model:
+  hidden_size:      64
+  num_lstm_layers:  2
+  fc_hidden:        32
+  lstm_dropout:     0.2
+  k_prod_init:      1.0
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  vanilla_mode:          false
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.1
+  lambda_anneal_delay:   30
+  lambda_anneal_epochs:  80
+
+output:
+  checkpoint: ./checkpoints/process_pi_lstm.pt
+  plots_dir:  ./outputs/process_pi_lstm/

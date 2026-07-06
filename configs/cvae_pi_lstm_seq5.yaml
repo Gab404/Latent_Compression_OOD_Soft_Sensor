@@ -1,0 +1,63 @@
+# configs/cvae_pi_lstm_seq5.yaml
+# ==============================
+# CVAE-PI-LSTM with seq_len=5 — ablation motivated by SHAP analysis showing
+# that the model uses very little spectral information from time steps earlier
+# than t-5.  All other hyperparameters are identical to cvae_pi_lstm (seq_len=24)
+# so the two models are directly comparable.
+#
+# Input pipeline (unchanged):
+#   raw Raman (2001D) -> SG(d=1, w=15, p=2) -> StandardScaler
+#   -> frozen CVAE encoder (mu) -> 64D latent -> MinMaxScaler -> LSTM
+#
+# Benchmark split: random seed=42, 72 train / 18 FF-val / 10 fault-test
+# Evaluation metric: sparse offline measurement points only (~20/batch)
+
+name: cvae_pi_lstm_seq5
+
+data:
+  csv_path:         ./100_Batches_IndPenSim_V3.csv
+  use_raman:        true
+  raman_encoder_type: cvae_v2              # selects CVAERamanEncoderV2
+  raman_ckpt:       ./checkpoints/cvae_best.pt
+  raman_scaler:     ./checkpoints/cvae_scaler.joblib
+  raman_latent_dim: 64                     # CVAE output dimensionality
+
+  # Data split -- must match all other benchmark models
+  split_strategy:   random
+  train_frac:       0.80
+  seed:             42
+  min_len:          50
+
+model:
+  hidden_size:      64
+  num_lstm_layers:  2
+  fc_hidden:        32
+  lstm_dropout:     0.2
+  k_prod_init:      1.0
+
+training:
+  seq_len:      5                          # ← only change vs cvae_pi_lstm
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  vanilla_mode:          false
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.1
+  lambda_anneal_delay:   30
+  lambda_anneal_epochs:  80
+
+output:
+  checkpoint: ./checkpoints/cvae_pi_lstm_seq5.pt
+  plots_dir:  ./outputs/cvae_pi_lstm_seq5/

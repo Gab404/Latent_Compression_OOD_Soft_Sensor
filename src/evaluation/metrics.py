@@ -27,13 +27,14 @@ def compute_metrics(
                 "R2": float("nan"), "n": 0}
 
     err  = y_pred - y_true
-    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mse  = float(np.mean(err ** 2))
+    rmse = float(np.sqrt(mse))
     mae  = float(np.mean(np.abs(err)))
     ss_r = float(np.sum(err ** 2))
     ss_t = float(np.sum((y_true - y_true.mean()) ** 2))
     r2   = float(1.0 - ss_r / ss_t) if ss_t > 0 else 0.0
 
-    return {"RMSE": rmse, "MAE": mae, "R2": r2, "n": int(len(y_true))}
+    return {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "n": int(len(y_true))}
 
 
 def aggregate_metrics(
@@ -74,6 +75,7 @@ def print_metrics_table(
         m = metrics_dict.get(tgt, {})
         if m:
             print(f"{prefix}  [{tname}]  "
+                  f"MSE={m.get('MSE', float('nan')):.4f} (g/L)²  "
                   f"RMSE={m.get('RMSE', float('nan')):.3f} g/L  "
                   f"MAE={m.get('MAE', float('nan')):.3f} g/L  "
                   f"R²={m.get('R2', float('nan')):.4f}  "
