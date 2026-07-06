@@ -13,7 +13,7 @@ print("--- ENTRAÎNEMENT DÉFINITIF : CNN 1D V4 (DONNÉES PURGÉES & VALIDATION)
 # =====================================================================
 # 1. DATA ENGINEERING & SÉQUENÇAGE ÉTANCHE
 # =====================================================================
-print("⏳ Chargement et nettoyage des données...")
+print(" Chargement et nettoyage des données...")
 df = pd.read_csv('IndPenSim_100_Batches.csv')
 
 # Correction de la colonne et création des vrais numéros de lots
@@ -61,7 +61,7 @@ scaler_y = StandardScaler().fit(df_train[colonnes_cibles].values)
 joblib.dump(scaler_raman, 'scaler_raman.pkl')
 joblib.dump(scaler_phys, 'scaler_phys.pkl')
 joblib.dump(scaler_y, 'scaler_y.pkl')
-print("✅ Scalers mis à jour et sauvegardés en fichiers .pkl")
+print(" Scalers mis à jour et sauvegardés en fichiers .pkl")
 
 def preparer_tenseurs(dataframe):
     T_ram = torch.FloatTensor(scaler_raman.transform(dataframe[colonnes_raman].values)).unsqueeze(1)
