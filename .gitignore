@@ -1,0 +1,17 @@
+# Dossiers d'environnement virtuel
+.venv/
+venv/
+env/
+ENV/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Fichiers de configuration de l'IDE (optionnel mais recommandé)
+.vscode/
+.idea/
+.DS_Store
+
+./100_Batches_IndPenSim_V3.csv
