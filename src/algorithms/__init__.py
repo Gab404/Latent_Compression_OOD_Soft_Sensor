@@ -18,6 +18,12 @@ from src.algorithms.pls_pi_lstm       import PLSPILSTMAlgorithm          # noqa:
 from src.algorithms.delta_cdae_pi_lstm   import DeltaCDAEPILSTMAlgorithm    # noqa: F401
 from src.algorithms.cdae_process_pi_lstm import CDAEProcessPILSTMAlgorithm  # noqa: F401
 from src.algorithms.process_pi_lstm      import ProcessPILSTMAlgorithm      # noqa: F401
+from src.algorithms.beta_vae_pi_lstm     import BetaVAEPILSTMAlgorithm      # noqa: F401
+from src.algorithms.beta_vae_lp_pi_lstm  import BetaVAELPPILSTMAlgorithm    # noqa: F401
+from src.algorithms.beta_vae_lstm        import BetaVAELSTMAlgorithm         # noqa: F401
+from src.algorithms.beta_vae_latent_lp_pi_lstm import BetaVAELatentLPPILSTMAlgorithm  # noqa: F401
+from src.algorithms.beta_vae_mamba        import BetaVAEMambaAlgorithm           # noqa: F401
+from src.algorithms.beta_vae_liquid       import BetaVAELiquidAlgorithm          # noqa: F401
 
 
 def get_algorithm(name: str) -> type:
@@ -28,7 +34,7 @@ def get_algorithm(name: str) -> type:
     ----------
     name : str
         One of: ``"pi_lstm"``, ``"neural_ode"``,
-        ``"cdae_pi_lstm"``, ``"cvae_pi_lstm"``,
+        ``"cdae_pi_lstm"``, ``"cvae_pi_lstm"``, ``"beta_vae_pi_lstm"``,
         ``"pca_pi_lstm"``, ``"pls_pi_lstm"``,
         ``"delta_cdae_pi_lstm"``, ``"cdae_process_pi_lstm"``,
         ``"process_pi_lstm"``.
@@ -58,5 +64,11 @@ __all__ = [
     "DeltaCDAEPILSTMAlgorithm",
     "CDAEProcessPILSTMAlgorithm",
     "ProcessPILSTMAlgorithm",
+    "BetaVAEPILSTMAlgorithm",
+    "BetaVAELPPILSTMAlgorithm",
+    "BetaVAELSTMAlgorithm",
+    "BetaVAELatentLPPILSTMAlgorithm",
+    "BetaVAEMambaAlgorithm",
+    "BetaVAELiquidAlgorithm",
     "get_algorithm",
 ]

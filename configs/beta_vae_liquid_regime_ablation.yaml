@@ -1,0 +1,70 @@
+# configs/beta_vae_liquid_regime_ablation.yaml
+# =============================================
+# β-VAE-LiquidNet Regime-Ablation — CfC (Closed-form Continuous-time) temporal
+# core trained exclusively on Regime 1 (batches 1-30) and evaluated on all
+# downstream regimes.  Direct counterpart to beta_vae_mamba_regime_ablation.yaml.
+#
+# Use with:  --model beta_vae_liquid --regime-ablation --no-early-stopping
+#
+# Split (driven by train.py --regime-ablation flag):
+#   Train / Val → Regime 1 (batches 1-30), 80/20 random, seed=42
+#   Test R2     → Regime 2 (batches 31-60, operator-controlled)
+#   Test R3     → Regime 3 (batches 61-90, APC closed-loop)
+#   Test Fault  → Faulty   (batches 91-100)
+#
+# CfC design choices:
+#   - FullyConnected wiring (same connectivity budget as LSTM/Mamba)
+#   - mode="default"  (gated CfC — best generalisation per ncps paper)
+#   - backbone_layers=1, backbone_units=128 (pre-liquid input projection MLP)
+#   - cfc_units=64 (matches β-VAE latent dim for fair comparison)
+
+name: beta_vae_liquid_regime_ablation
+
+data:
+  csv_path:           ./100_Batches_IndPenSim_V3.csv
+  use_raman:          true
+  raman_encoder_type: beta_vae
+  raman_ckpt:         ./checkpoints/beta_vae_best.pt
+  raman_scaler:       ./checkpoints/beta_vae_scaler.joblib
+  raman_latent_dim:   64
+
+  split_strategy:     random   # overridden by --regime-ablation at runtime
+  train_frac:         0.80
+  seed:               42
+  min_len:            50
+
+model:
+  cfc_units:        64      # liquid state dimension (= input_size, no projection)
+  mode:             default # "default" (gated) | "pure" | "no_gate"
+  backbone_units:   128     # backbone MLP hidden size inside the CfC cell
+  backbone_layers:  1       # number of backbone layers (0 = no backbone)
+  backbone_dropout: 0.0     # backbone dropout
+  fc_hidden:        32      # output head hidden size
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2    # unused, kept for compat
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  # Physics fully disabled
+  vanilla_mode:          true
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.0
+  lambda_anneal_delay:   0
+  lambda_anneal_epochs:  1
+
+output:
+  checkpoint: ./checkpoints/beta_vae_liquid_regime_ablation.pt
+  plots_dir:  ./outputs/beta_vae_liquid_regime_ablation/

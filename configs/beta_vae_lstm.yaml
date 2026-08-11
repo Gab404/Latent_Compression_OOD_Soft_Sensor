@@ -1,0 +1,60 @@
+# configs/beta_vae_lstm.yaml
+# ===========================
+# β-VAE-LSTM Vanilla Baseline — identical architecture to beta_vae_pi_lstm
+# but with the physics (mass-balance) loss fully disabled (vanilla_mode: true).
+#
+# Used as the ablation control for the physics contribution study:
+#   PI model   → beta_vae_pi_lstm.pt   (lambda_physics > 0, physics-regularised)
+#   Base model → beta_vae_lstm.pt      (lambda_physics = 0, data-driven only)
+#
+# Split: random seed=42, 72 train / 18 FF-val / 10 fault-test
+
+name: beta_vae_lstm
+
+data:
+  csv_path:           ./100_Batches_IndPenSim_V3.csv
+  use_raman:          true
+  raman_encoder_type: beta_vae
+  raman_ckpt:         ./checkpoints/beta_vae_best.pt
+  raman_scaler:       ./checkpoints/beta_vae_scaler.joblib
+  raman_latent_dim:   64
+
+  split_strategy:     random
+  train_frac:         0.80
+  seed:               42
+  min_len:            50
+
+model:
+  hidden_size:      64
+  num_lstm_layers:  2
+  fc_hidden:        32
+  lstm_dropout:     0.2
+  k_prod_init:      1.0
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  # ── Physics disabled ──────────────────────────────────────────────────────
+  vanilla_mode:          true      # disables mass-balance loss entirely
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.0
+  lambda_anneal_delay:   0
+  lambda_anneal_epochs:  1
+
+output:
+  checkpoint: ./checkpoints/beta_vae_lstm.pt
+  plots_dir:  ./outputs/beta_vae_lstm/

@@ -61,16 +61,19 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 from scipy.signal import savgol_filter
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 # ── Project root on sys.path ──────────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parent
+# __file__ is scripts/train_autoencoder.py → parent is scripts/ → parent.parent is project root
+_ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.autoencoder.model import CDAE_Raman, CVAE_Raman
+from src.autoencoder.model import CDAE_Raman, CVAE_Raman, BetaVAE_Raman
+from src.autoencoder.beta_schedule import LinearBetaSchedule, CyclicalBetaSchedule
 from src.data.dataset import RAMAN_START_COL_IDX, FAULT_COL
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -252,6 +255,38 @@ def cvae_loss(
     """
     recon_loss = nn.functional.mse_loss(recon, target)
     kl_loss    = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+    total      = recon_loss + beta * kl_loss
+    return total, recon_loss, kl_loss
+
+
+def beta_vae_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    log_var: torch.Tensor,
+    beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    β-VAE ELBO with KL summed over latent dims and averaged over the batch.
+
+    Differs from ``cvae_loss`` in the KL estimator:
+        cvae_loss   : ``torch.mean(…)``   — mean over *both* batch and latent dims
+        beta_vae_loss: ``sum_D / mean_B`` — sum over latent dim, mean over batch
+
+    This matches the standard β-VAE formulation (Higgins et al., 2017) and
+    makes the KL term scale with latent_dim, which matters when sweeping β.
+
+    Returns
+    -------
+    total      : recon_loss + β · kl_loss
+    recon_loss : MSE reconstruction term
+    kl_loss    : KL divergence (per-sample average, summed across latent dims)
+    """
+    recon_loss = nn.functional.mse_loss(recon, target)          # scalar mean
+    # sum over latent dim D, mean over batch B  → shape ()
+    kl_loss    = -0.5 * torch.mean(
+        torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+    )
     total      = recon_loss + beta * kl_loss
     return total, recon_loss, kl_loss
 
@@ -469,15 +504,182 @@ def train_cvae(
     print(f"  Scaler saved       : {scaler_out}")
 
 
+def train_beta_vae(
+    csv_path:        str,
+    ckpt_out:        str,
+    scaler_out:      str,
+    latent_dim:      int   = LATENT_DIM,
+    max_beta:        float = 4.0,
+    anneal_schedule: str   = "linear",
+    anneal_epochs:   int   = 100,
+    anneal_delay:    int   = 0,
+    n_cycles:        int   = 4,
+    n_epochs:        int   = N_EPOCHS,
+    batch_size:      int   = BATCH_SIZE,
+    lr:              float = LR,
+    weight_decay:    float = WEIGHT_DECAY,
+    seed:            int   = SEED,
+    device:          str   = "cuda",
+    use_amp:         bool  = False,
+    use_amp:         bool  = False,
+) -> None:
+    """Train BetaVAE_Raman with β annealing and save checkpoint + scaler."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    amp_enabled = use_amp and dev.type == "cuda"
+    print(f"\n{'='*60}")
+    print(f"  Training β-VAE  |  latent={latent_dim}  max_β={max_beta}  AMP={amp_enabled}")
+    print(f"  schedule={anneal_schedule}  anneal_epochs={anneal_epochs}  "
+          f"delay={anneal_delay}  n_cycles={n_cycles}  device={dev}")
+    print(f"{'='*60}")
+
+    # ── Build β schedule ──────────────────────────────────────────────────────
+    if anneal_schedule == "linear":
+        schedule = LinearBetaSchedule(
+            max_beta=max_beta,
+            anneal_epochs=anneal_epochs,
+            delay_epochs=anneal_delay,
+        )
+    else:  # cyclical
+        schedule = CyclicalBetaSchedule(
+            max_beta=max_beta,
+            total_epochs=n_epochs,
+            n_cycles=n_cycles,
+            ratio=0.5,
+        )
+    print(f"  β schedule: {schedule}")
+
+    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed)
+    X_train, X_val, scaler = preprocess(X_train_raw, X_val_raw)
+    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size)
+
+    model = BetaVAE_Raman(
+        input_length=N_RAMAN_COLS,
+        latent_dim=latent_dim,
+    ).to(dev)
+
+    optim   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                  optim, mode="min", factor=LR_FACTOR,
+                  patience=LR_PATIENCE, verbose=True)
+    grad_scaler = GradScaler("cuda", enabled=amp_enabled)
+
+    best_val        = float("inf")
+    no_improv       = 0
+    beta_fully_on   = False   # set True once β first reaches max_beta
+
+    for epoch in range(1, n_epochs + 1):
+        beta = schedule.get_beta(epoch)
+
+        # Detect the first epoch where β reaches its maximum value.
+        # At this point we reset the early-stopping tracker so that the
+        # delay / ramp phases don't count against training time.
+        if not beta_fully_on and beta >= max_beta - 1e-6:
+            beta_fully_on = True
+            best_val      = float("inf")
+            no_improv     = 0
+            print(f"  Epoch {epoch}: β reached max ({beta:.4f}) — "
+                  f"early stopping and checkpoint tracking now active")
+
+        # ── Train ─────────────────────────────────────────────────────────────
+        model.train()
+        tr_total = tr_recon = tr_kl = 0.0
+        for (x,) in dl_train:
+            x = x.to(dev)
+            optim.zero_grad()
+            with autocast("cuda", enabled=amp_enabled):
+                recon, mu, log_var = model(x)    # reparameterised in train mode
+                loss, rec, kl = beta_vae_loss(recon, x, mu, log_var, beta=beta)
+            grad_scaler.unscale_(optim)
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            grad_scaler.step(optim)
+            grad_scaler.update()
+            n = len(x)
+            tr_total += loss.item() * n
+            tr_recon += rec.item()  * n
+            tr_kl    += kl.item()   * n
+        N = len(dl_train.dataset)
+        tr_total /= N;  tr_recon /= N;  tr_kl /= N
+
+        # ── Validate (use mu only, no sampling) ───────────────────────────────
+        model.eval()
+        va_total = va_recon = va_kl = 0.0
+        with torch.no_grad():
+            for (x,) in dl_val:
+                x = x.to(dev)
+                with autocast("cuda", enabled=amp_enabled):
+                    recon, mu, log_var = model(x)   # eval: uses mu (no sampling)
+                loss, rec, kl = beta_vae_loss(recon, x, mu, log_var, beta=beta)
+
+                n = len(x)
+                va_total += loss.item() * n
+                va_recon += rec.item()  * n
+                va_kl    += kl.item()   * n
+        Nv = len(dl_val.dataset)
+        va_total /= Nv;  va_recon /= Nv;  va_kl /= Nv
+
+        # ReduceLROnPlateau tracks reconstruction loss to avoid β noise
+        sched.step(va_recon)
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:4d}/{n_epochs}  β={beta:.4f}  "
+                  f"train={tr_total:.5f} (rec={tr_recon:.5f} kl={tr_kl:.5f})  "
+                  f"val={va_total:.5f} (rec={va_recon:.5f} kl={va_kl:.5f})  "
+                  f"lr={optim.param_groups[0]['lr']:.2e}")
+
+        # ── Early stopping / checkpoint ───────────────────────────────────────
+        # Only track and checkpoint once β has fully ramped up (beta_fully_on).
+        # Before that, the reconstruction is either unregularised (β=0) or in
+        # a transient ramp — we don't want those weights as the final encoder.
+        if beta_fully_on and va_recon < best_val - 1e-7:
+            best_val  = va_recon
+            no_improv = 0
+            Path(ckpt_out).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "epoch":            epoch,
+                    "model_state_dict": model.state_dict(),
+                    "val_loss":         best_val,
+                    "input_length":     N_RAMAN_COLS,
+                    "latent_dim":       latent_dim,
+                    "beta_schedule": {
+                        "type":          anneal_schedule,
+                        "max_beta":      max_beta,
+                        "anneal_epochs": anneal_epochs,
+                        "anneal_delay":  anneal_delay,
+                        "n_cycles":      n_cycles,
+                        "beta_at_save":  beta,
+                    },
+                },
+                ckpt_out,
+            )
+        else:
+            if beta_fully_on:
+                no_improv += 1
+                if no_improv >= ES_PATIENCE:
+                    print(f"  Early stopping at epoch {epoch} "
+                          f"(no improvement for {ES_PATIENCE} epochs)")
+                    break
+
+    joblib.dump(scaler, scaler_out)
+    print(f"\n  β-VAE best val recon loss : {best_val:.6f}")
+    print(f"  Checkpoint saved    : {ckpt_out}")
+    print(f"  Scaler saved        : {scaler_out}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train CDAE or CVAE Raman autoencoder on IndPenSim V3"
+        description="Train CDAE, CVAE, or β-VAE Raman autoencoder on IndPenSim V3"
     )
-    parser.add_argument("--model",       choices=["cdae", "cvae"], default="cdae",
+    parser.add_argument("--model",       choices=["cdae", "cvae", "beta_vae"],
+                        default="cdae",
                         help="Which autoencoder to train (default: cdae)")
     parser.add_argument("--csv",         default="./100_Batches_IndPenSim_V3.csv",
                         help="Path to IndPenSim V3 CSV")
@@ -487,9 +689,23 @@ def main() -> None:
     parser.add_argument("--lr",          type=float, default=LR)
     parser.add_argument("--weight-decay",type=float, default=WEIGHT_DECAY)
     parser.add_argument("--noise-std",   type=float, default=NOISE_STD,
-                        help="CDAE denoising noise std (ignored for CVAE)")
+                        help="CDAE denoising noise std (ignored for CVAE/β-VAE)")
     parser.add_argument("--beta",        type=float, default=BETA_VAE,
-                        help="KL weight β for CVAE ELBO (ignored for CDAE)")
+                        help="Fixed KL weight β for CVAE ELBO (ignored for CDAE/β-VAE)")
+    # β-VAE specific arguments
+    parser.add_argument("--max-beta",    type=float, default=4.0,
+                        help="Maximum β for β-VAE annealing (default: 4.0)")
+    parser.add_argument("--anneal-schedule", choices=["linear", "cyclical"],
+                        default="linear",
+                        help="β annealing schedule for β-VAE (default: linear)")
+    parser.add_argument("--anneal-epochs",   type=int, default=100,
+                        help="Epochs to ramp β from 0 → max_beta (linear schedule, default: 100)")
+    parser.add_argument("--anneal-delay",    type=int, default=0,
+                        help="Epochs to keep β=0 before annealing (default: 0)")
+    parser.add_argument("--n-cycles",        type=int, default=4,
+                        help="Number of annealing cycles (cyclical schedule, default: 4)")
+    parser.add_argument("--amp",             action="store_true",
+                        help="Enable automatic mixed precision (float16, CUDA only)")
     parser.add_argument("--seed",        type=int,   default=SEED)
     parser.add_argument("--device",      default="cuda",
                         help="Training device: cuda | cpu")
@@ -515,7 +731,7 @@ def main() -> None:
             seed        = args.seed,
             device      = args.device,
         )
-    else:  # cvae
+    elif args.model == "cvae":
         ckpt_out   = args.ckpt   or "./checkpoints/cvae_best.pt"
         scaler_out = args.scaler or "./checkpoints/cvae_scaler.joblib"
         train_cvae(
@@ -530,6 +746,27 @@ def main() -> None:
             weight_decay= args.weight_decay,
             seed        = args.seed,
             device      = args.device,
+        )
+    else:  # beta_vae
+        ckpt_out   = args.ckpt   or "./checkpoints/beta_vae_best.pt"
+        scaler_out = args.scaler or "./checkpoints/beta_vae_scaler.joblib"
+        train_beta_vae(
+            csv_path        = args.csv,
+            ckpt_out        = ckpt_out,
+            scaler_out      = scaler_out,
+            latent_dim      = args.latent_dim,
+            max_beta        = args.max_beta,
+            anneal_schedule = args.anneal_schedule,
+            anneal_epochs   = args.anneal_epochs,
+            anneal_delay    = args.anneal_delay,
+            n_cycles        = args.n_cycles,
+            n_epochs        = args.epochs,
+            batch_size      = args.batch_size,
+            lr              = args.lr,
+            weight_decay    = args.weight_decay,
+            seed            = args.seed,
+            device          = args.device,
+            use_amp         = args.amp,
         )
 
 

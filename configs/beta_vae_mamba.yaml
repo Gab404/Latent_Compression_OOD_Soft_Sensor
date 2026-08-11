@@ -1,0 +1,60 @@
+# configs/beta_vae_mamba.yaml
+# ============================
+# β-VAE-Mamba: Mamba-SSM temporal core for Penicillin soft-sensing.
+# Input: 64-dim β-VAE posterior means from Raman spectra.
+# Output: pen_norm (Penicillin, normalised, single head).
+# No physics loss — pure data-driven MSE baseline.
+#
+# Split: random 80/20 of all 90 fault-free batches (ids 0–89), seed=42.
+# Test:  faulty batches 91–100 (ids 90–99).
+
+name: beta_vae_mamba
+
+data:
+  csv_path:           ./100_Batches_IndPenSim_V3.csv
+  use_raman:          true
+  raman_encoder_type: beta_vae
+  raman_ckpt:         ./checkpoints/beta_vae_best.pt
+  raman_scaler:       ./checkpoints/beta_vae_scaler.joblib
+  raman_latent_dim:   64
+
+  split_strategy:     random
+  train_frac:         0.80
+  seed:               42
+  min_len:            50
+
+model:
+  d_model:          64    # Mamba hidden dim (= input_size, no projection needed)
+  num_mamba_layers: 2     # stacked Mamba blocks
+  d_state:          16    # SSM state expansion factor
+  d_conv:           4     # local convolution width
+  expand:           2     # block expansion factor
+  fc_hidden:        32    # output FC head hidden size
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2    # unused (no physics params), kept for compat
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  # Physics fully disabled
+  vanilla_mode:          true
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.0
+  lambda_anneal_delay:   0
+  lambda_anneal_epochs:  1
+
+output:
+  checkpoint: ./checkpoints/beta_vae_mamba.pt
+  plots_dir:  ./outputs/beta_vae_mamba/

@@ -1,0 +1,65 @@
+# configs/beta_vae_latent_lp_pi_lstm.yaml
+# =========================================
+# β-VAE Latent Luedeking-Piret PI-LSTM
+#
+# Physics loss: real LP ODE anchored to z38 (latent dim 37, |r|=0.99 with
+# Biomass) instead of the unconstrained r_net proxy used in beta_vae_pi_lstm.
+#
+#   ΔP_phy = (α · ΔX_latent + β · X_latent) · dt_n
+#
+# This eliminates the "trivial solution" trap: the network can no longer zero
+# the physics residual by freely shaping r_net.
+#
+# Split: random 80/20 of all 90 fault-free batches (ids 0–89), seed=42.
+# Test:  faulty batches 91–100 (ids 90–99).
+
+name: beta_vae_latent_lp_pi_lstm
+
+data:
+  csv_path:           ./100_Batches_IndPenSim_V3.csv
+  use_raman:          true
+  raman_encoder_type: beta_vae
+  raman_ckpt:         ./checkpoints/beta_vae_best.pt
+  raman_scaler:       ./checkpoints/beta_vae_scaler.joblib
+  raman_latent_dim:   64
+
+  split_strategy:     random
+  train_frac:         0.80
+  seed:               42
+  min_len:            50
+
+model:
+  hidden_size:      64
+  num_lstm_layers:  2
+  fc_hidden:        32
+  lstm_dropout:     0.2
+  latent_bio_idx:   37       # z38 (0-indexed) — Biomass dim, |r|=0.99
+  alpha_init:       1.0      # LP growth-associated coefficient α
+  beta_init:        1.0      # LP maintenance coefficient β
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2      # separate lr for α and β
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  vanilla_mode:          false
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.1
+  lambda_anneal_delay:   30
+  lambda_anneal_epochs:  80
+
+output:
+  checkpoint: ./checkpoints/beta_vae_latent_lp_pi_lstm.pt
+  plots_dir:  ./outputs/beta_vae_latent_lp_pi_lstm/

@@ -2,12 +2,13 @@
 """
 shap_analysis.py
 ================
-SHAP-based explainability for the CVAE-PI-LSTM penicillin soft-sensor.
+SHAP-based explainability for the CVAE-PI-LSTM / β-VAE-PI-LSTM penicillin
+soft-sensor.
 
 Maps SHAP values back to the original 2001 Raman wavenumber axis so that
 chemically interpretable spectral regions can be identified.
 
-Two outputs are produced in outputs/shap/:
+Two outputs are produced in the output directory:
   1. global_importance.png  — mean |SHAP| per wavenumber (bar chart, top-50)
   2. temporal_heatmap.png   — SHAP(T=24, top-K wavenumbers) for one test sample
 
@@ -17,17 +18,19 @@ End-to-end differentiable chain for SHAP gradient backpropagation
   → clamp(min=0)                  # ReLU-like; approximate gradient used
   → FrozenSGFilter                # SG d=1, w=15, p=2  →  frozen nn.Conv1d
   → FrozenStandardScaler          # (x - mu) / sigma, frozen buffers
-  → CVAE_Raman.encode() → mu      # NO reparameterisation; mu only
+  → <encoder>.encode() → mu       # NO reparameterisation; mu only
   → FrozenMinMaxScaler            # (x - min) / range, frozen buffers
   → CDAEPILSTMModel.forward()     # LSTM → (B, T, 2)
   → pred[:, -1, 0]                # scalar pen_norm at the last time step
 
 Usage
 -----
-    python shap_analysis.py [--n-bg N] [--n-test N] [--top-k K] [--sample IDX]
+    python shap_analysis.py [--model cvae|beta_vae]
+                            [--n-bg N] [--n-test N] [--top-k K] [--sample IDX]
                             [--device cuda|cpu] [--csv PATH] [--seed N]
 
-Defaults: n-bg=100, n-test=50, top-k=20, sample=0, device auto, csv ./100_Batches_IndPenSim_V3.csv
+Defaults: model=cvae, n-bg=100, n-test=50, top-k=20, sample=0,
+          device=auto, csv=./100_Batches_IndPenSim_V3.csv
 """
 
 from __future__ import annotations
@@ -54,11 +57,34 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.autoencoder.model import CVAE_Raman
+from src.autoencoder.model import CVAE_Raman, BetaVAE_Raman
 from src.models.cdae_pi_lstm import CDAEPILSTMModel
 from src.algorithms.base import ScalerBundle
 import src.algorithms.cvae_pi_lstm  # noqa: F401 — registers CVAEPILSTMAlgorithm
+import src.algorithms.beta_vae_pi_lstm  # noqa: F401 — registers BetaVAEPILSTMAlgorithm
 from src.data.dataset import RAMAN_START_COL_IDX
+
+# Human-readable labels for each supported model type
+MODEL_LABELS = {
+    "cvae":     "CVAE-PI-LSTM",
+    "beta_vae": "\u03b2-VAE-PI-LSTM",
+}
+
+# Default checkpoint / scaler / output-dir per model type
+MODEL_DEFAULTS = {
+    "cvae": {
+        "encoder_ckpt":  "./checkpoints/cvae_best.pt",
+        "encoder_scaler": "./checkpoints/cvae_scaler.joblib",
+        "lstm_ckpt":     "./checkpoints/cvae_pi_lstm.pt",
+        "output_dir":    "./outputs/shap",
+    },
+    "beta_vae": {
+        "encoder_ckpt":  "./checkpoints/beta_vae_best.pt",
+        "encoder_scaler": "./checkpoints/beta_vae_scaler.joblib",
+        "lstm_ckpt":     "./checkpoints/beta_vae_pi_lstm.pt",
+        "output_dir":    "./outputs/shap_beta_vae",
+    },
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,15 +216,18 @@ class EndToEndCVAEPILSTM(nn.Module):
     """
     Full differentiable inference chain from raw Raman sequences to pen_norm.
 
+    Supports both CVAE_Raman and BetaVAE_Raman encoders via the same interface
+    (both expose .encode() → (mu, log_var)).
+
     This module is ONLY used for SHAP attribution — it is never trained.
     All sub-modules have their parameters frozen; only gradient flow is used.
 
     Parameters
     ----------
-    cvae          : CVAE_Raman           — loaded from checkpoints/cvae_best.pt
-    std_scaler    : FrozenStandardScaler — wraps cvae_scaler.joblib
-    mm_scaler     : FrozenMinMaxScaler   — wraps scalers.feat from cvae_pi_lstm.pt
-    lstm_model    : CDAEPILSTMModel      — loaded from cvae_pi_lstm.pt
+    encoder       : CVAE_Raman or BetaVAE_Raman — loaded from the relevant checkpoint
+    std_scaler    : FrozenStandardScaler — wraps the encoder's scaler.joblib
+    mm_scaler     : FrozenMinMaxScaler   — wraps scalers.feat from the LSTM checkpoint
+    lstm_model    : CDAEPILSTMModel      — loaded from the LSTM checkpoint
     sg_filter     : FrozenSGFilter       — SG d=1, w=15, p=2
     n_wavenumbers : int                  — 2001
     seq_len       : int                  — 24
@@ -206,7 +235,7 @@ class EndToEndCVAEPILSTM(nn.Module):
 
     def __init__(
         self,
-        cvae:          CVAE_Raman,
+        encoder:       nn.Module,
         std_scaler:    FrozenStandardScaler,
         mm_scaler:     FrozenMinMaxScaler,
         lstm_model:    CDAEPILSTMModel,
@@ -215,7 +244,7 @@ class EndToEndCVAEPILSTM(nn.Module):
         seq_len:       int = 24,
     ) -> None:
         super().__init__()
-        self.cvae          = cvae
+        self.cvae          = encoder   # keep attribute name for backward compat
         self.std_scaler    = std_scaler
         self.mm_scaler     = mm_scaler
         self.lstm_model    = lstm_model
@@ -282,33 +311,41 @@ def load_end_to_end_model(
     device:      torch.device,
     seq_len:     int = 24,
     n_wavenumbers: int = 2001,
+    model_type:  str = "cvae",
 ) -> Tuple[EndToEndCVAEPILSTM, ScalerBundle]:
     """
     Load all model components and assemble the end-to-end differentiable module.
 
     Parameters
     ----------
-    cvae_ckpt    : path to checkpoints/cvae_best.pt
-    cvae_scaler  : path to checkpoints/cvae_scaler.joblib
-    lstm_ckpt    : path to checkpoints/cvae_pi_lstm.pt
+    cvae_ckpt    : path to the encoder checkpoint (cvae_best.pt or beta_vae_best.pt)
+    cvae_scaler  : path to the encoder StandardScaler (joblib)
+    lstm_ckpt    : path to the LSTM algorithm checkpoint
     device       : torch device
     seq_len      : sliding-window length (default 24)
     n_wavenumbers: Raman channels (default 2001)
+    model_type   : "cvae" or "beta_vae"  (selects which encoder class to instantiate)
 
     Returns
     -------
     model   : EndToEndCVAEPILSTM in eval() mode on device
     scalers : ScalerBundle from the LSTM checkpoint (for pen inverse-scaling)
     """
-    # ── Load CVAE ──────────────────────────────────────────────────────────
-    print(f"  Loading CVAE from {Path(cvae_ckpt).name} ...")
-    cvae_state    = torch.load(cvae_ckpt, map_location="cpu", weights_only=False)
-    input_length  = int(cvae_state.get("input_length", n_wavenumbers))
-    latent_dim    = int(cvae_state.get("latent_dim",   64))
+    label = MODEL_LABELS.get(model_type, model_type)
 
-    cvae = CVAE_Raman(input_length=input_length, latent_dim=latent_dim)
-    cvae.load_state_dict(cvae_state["model_state_dict"])
-    cvae.eval()
+    # ── Load encoder ──────────────────────────────────────────────────────────
+    print(f"  Loading {label} encoder from {Path(cvae_ckpt).name} ...")
+    enc_state     = torch.load(cvae_ckpt, map_location="cpu", weights_only=False)
+    input_length  = int(enc_state.get("input_length", n_wavenumbers))
+    latent_dim    = int(enc_state.get("latent_dim",   64))
+
+    if model_type == "beta_vae":
+        encoder = BetaVAE_Raman(input_length=input_length, latent_dim=latent_dim)
+    else:
+        encoder = CVAE_Raman(input_length=input_length, latent_dim=latent_dim)
+
+    encoder.load_state_dict(enc_state["model_state_dict"])
+    encoder.eval()
     print(f"    input_length={input_length}  latent_dim={latent_dim}")
 
     # ── Load StandardScaler for Raman spectra ─────────────────────────────
@@ -316,8 +353,8 @@ def load_end_to_end_model(
     sklearn_std_scaler = joblib.load(cvae_scaler)
     std_scaler = FrozenStandardScaler(sklearn_std_scaler)
 
-    # ── Load CVAE-PI-LSTM checkpoint ───────────────────────────────────────
-    print(f"  Loading CVAE-PI-LSTM from {Path(lstm_ckpt).name} ...")
+    # ── Load LSTM checkpoint ───────────────────────────────────────────────
+    print(f"  Loading {label} LSTM from {Path(lstm_ckpt).name} ...")
     import pickle
     lstm_ckpt_data = torch.load(lstm_ckpt, map_location="cpu", weights_only=False)
     scalers        = ScalerBundle.from_dict(lstm_ckpt_data["scalers"])
@@ -339,7 +376,7 @@ def load_end_to_end_model(
     k_prod = float(lstm_model.k_prod.item())
     print(f"    k_prod={k_prod:.4f}")
 
-    # ── MinMaxScaler for CVAE latents ──────────────────────────────────────
+    # ── MinMaxScaler for encoder latents ──────────────────────────────────
     mm_scaler = FrozenMinMaxScaler(scalers.feat)
 
     # ── SG Filter ─────────────────────────────────────────────────────────
@@ -347,7 +384,7 @@ def load_end_to_end_model(
 
     # ── Assemble end-to-end model ──────────────────────────────────────────
     model = EndToEndCVAEPILSTM(
-        cvae          = cvae,
+        encoder       = encoder,
         std_scaler    = std_scaler,
         mm_scaler     = mm_scaler,
         lstm_model    = lstm_model,
@@ -358,11 +395,11 @@ def load_end_to_end_model(
 
     # cuDNN's LSTM backward pass requires the LSTM to be in training mode at
     # the time of the forward pass (it caches activations needed for backprop).
-    # BN layers in CVAE must stay in eval() mode to use running statistics.
+    # BN layers in the encoder must stay in eval() mode to use running statistics.
     # Since lstm_dropout=0.0, train() mode on the LSTM has no other side effects.
     model.lstm_model.lstm.train()
 
-    print(f"  EndToEndCVAEPILSTM assembled on {device}")
+    print(f"  {label} end-to-end model assembled on {device}")
     print(f"  LSTM set to train() for cuDNN backward compatibility.")
     return model, scalers
 
@@ -679,6 +716,7 @@ def plot_global_importance(
     wavenumber_labels: List[str],
     output_dir:        Path,
     top_k:             int = 50,
+    model_label:       str = "CVAE-PI-LSTM",
 ) -> None:
     """
     Bar chart: mean |SHAP| aggregated over samples (N) and time steps (T).
@@ -691,6 +729,7 @@ def plot_global_importance(
     wavenumber_labels  : list of 2001 wavenumber strings
     output_dir         : directory to save the figure
     top_k              : number of top wavenumbers to show (default 50)
+    model_label        : human-readable model name for plot title
     """
     # Mean absolute SHAP over N and T → (2001,)
     mean_abs = np.abs(shap_values).mean(axis=(0, 1))
@@ -707,9 +746,9 @@ def plot_global_importance(
     ax.set_yticklabels(top_lbls[::-1], fontsize=7)
     ax.set_xlabel("Mean |SHAP value|  (pen_norm units)", fontsize=11)
     ax.set_title(
-        f"Global Raman Feature Importance  (CVAE-PI-LSTM)\n"
+        f"Global Raman Feature Importance  ({model_label})\n"
         f"Top-{top_k} wavenumbers  |  averaged over {shap_values.shape[0]} "
-        f"samples × T={shap_values.shape[1]} time steps",
+        f"samples \u00d7 T={shap_values.shape[1]} time steps",
         fontsize=12,
     )
     ax.invert_yaxis()
@@ -802,6 +841,7 @@ def plot_shap_spectrum_overlay(
     wavenumber_labels: List[str],
     output_dir:        Path,
     sample_idx:        int = 0,
+    model_label:       str = "CVAE-PI-LSTM",
 ) -> None:
     """
     Overlay the mean Raman spectrum with the global |SHAP| profile.
@@ -815,6 +855,7 @@ def plot_shap_spectrum_overlay(
     wavenumber_labels  : list of 2001 wavenumber strings
     output_dir         : directory to save the figure
     sample_idx         : sample to overlay SHAP from (default: mean over all)
+    model_label        : human-readable model name for plot title
     """
     # Try to parse numeric wavenumbers from column names
     try:
@@ -832,7 +873,7 @@ def plot_shap_spectrum_overlay(
 
     ax1.plot(wn, mean_spectrum / max(mean_spectrum.max(), 1e-6),
              color=color1, linewidth=0.8, alpha=0.7, label="Mean Raman spectrum (norm.)")
-    ax1.set_xlabel("Raman wavenumber (cm⁻¹)" if wn[-1] > 100 else "Wavenumber index",
+    ax1.set_xlabel("Raman wavenumber (cm\u207b\u00b9)" if wn[-1] > 100 else "Wavenumber index",
                    fontsize=11)
     ax1.set_ylabel("Normalised intensity", color=color1, fontsize=10)
     ax1.tick_params(axis="y", labelcolor=color1)
@@ -848,7 +889,7 @@ def plot_shap_spectrum_overlay(
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
 
     ax1.set_title(
-        "Raman Spectrum vs. Global SHAP Importance  (CVAE-PI-LSTM)",
+        f"Raman Spectrum vs. Global SHAP Importance  ({model_label})",
         fontsize=12,
     )
     plt.tight_layout()
@@ -865,17 +906,20 @@ def plot_shap_spectrum_overlay(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="SHAP explainability for CVAE-PI-LSTM Raman soft-sensor",
+        description="SHAP explainability for CVAE-PI-LSTM / β-VAE-PI-LSTM Raman soft-sensor",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--model", default="cvae",
+                   choices=["cvae", "beta_vae"],
+                   help="Which encoder model to explain (cvae or beta_vae)")
     p.add_argument("--csv",       default="./100_Batches_IndPenSim_V3.csv",
                    help="Path to IndPenSim V3 CSV")
-    p.add_argument("--cvae-ckpt", default="./checkpoints/cvae_best.pt",
-                   help="CVAE encoder checkpoint")
-    p.add_argument("--cvae-scaler", default="./checkpoints/cvae_scaler.joblib",
-                   help="StandardScaler for SG-filtered Raman (joblib)")
-    p.add_argument("--lstm-ckpt", default="./checkpoints/cvae_pi_lstm.pt",
-                   help="CVAE-PI-LSTM algorithm checkpoint")
+    p.add_argument("--cvae-ckpt", default=None,
+                   help="Encoder checkpoint (defaults to model-specific path)")
+    p.add_argument("--cvae-scaler", default=None,
+                   help="StandardScaler for SG-filtered Raman (defaults to model-specific path)")
+    p.add_argument("--lstm-ckpt", default=None,
+                   help="LSTM algorithm checkpoint (defaults to model-specific path)")
     p.add_argument("--n-bg",    type=int, default=100,
                    help="Number of background samples for SHAP")
     p.add_argument("--n-test",  type=int, default=50,
@@ -887,8 +931,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device",  default="auto",
                    choices=["auto", "cuda", "cpu"],
                    help="Compute device")
-    p.add_argument("--output-dir", default="./outputs/shap",
-                   help="Directory to save output figures")
+    p.add_argument("--output-dir", default=None,
+                   help="Directory to save output figures (defaults to model-specific path)")
     p.add_argument("--seed",    type=int, default=42,
                    help="Train/val/test split seed (must match training)")
     p.add_argument("--shap-batch", type=int, default=10,
@@ -901,24 +945,34 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # ── Resolve model-specific defaults ──────────────────────────────────────
+    defaults    = MODEL_DEFAULTS[args.model]
+    model_label = MODEL_LABELS[args.model]
+    enc_ckpt    = args.cvae_ckpt   or defaults["encoder_ckpt"]
+    enc_scaler  = args.cvae_scaler or defaults["encoder_scaler"]
+    lstm_ckpt   = args.lstm_ckpt   or defaults["lstm_ckpt"]
+    out_dir_str = args.output_dir  or defaults["output_dir"]
+
     # ── Device ───────────────────────────────────────────────────────────────
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    print(f"\n  Device: {device}")
+    print(f"\n  Model  : {model_label}")
+    print(f"  Device : {device}")
 
     # ── Output directory ──────────────────────────────────────────────────────
-    out_dir = Path(args.output_dir)
+    out_dir = Path(out_dir_str)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load model ────────────────────────────────────────────────────────────
     print("\n── Loading model ────────────────────────────────────────────────")
     model, scalers = load_end_to_end_model(
-        cvae_ckpt   = args.cvae_ckpt,
-        cvae_scaler = args.cvae_scaler,
-        lstm_ckpt   = args.lstm_ckpt,
+        cvae_ckpt   = enc_ckpt,
+        cvae_scaler = enc_scaler,
+        lstm_ckpt   = lstm_ckpt,
         device      = device,
+        model_type  = args.model,
     )
 
     # ── Prepare data ──────────────────────────────────────────────────────────
@@ -961,6 +1015,7 @@ def main() -> None:
         wavenumber_labels  = wavenumber_labels,
         output_dir         = out_dir,
         top_k              = 50,
+        model_label        = model_label,
     )
 
     sample_idx = min(args.sample, len(X_test) - 1)
@@ -977,6 +1032,7 @@ def main() -> None:
         X_test             = X_test,
         wavenumber_labels  = wavenumber_labels,
         output_dir         = out_dir,
+        model_label        = model_label,
     )
 
     print(f"\n  All outputs saved to {out_dir}/")

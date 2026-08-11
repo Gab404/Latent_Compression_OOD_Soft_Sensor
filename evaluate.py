@@ -39,25 +39,38 @@ _REGIME_2_IDS = set(range(30, 60))   # batches 31-60  operator-controlled
 _REGIME_3_IDS = set(range(60, 90))   # batches 61-90  APC closed-loop
 
 
-def _regime_ablation_splits(dm, seed: int = 42):
+def _regime_ablation_splits(dm, seed: int = 42, test_regime: int = 2):
     """
-    Leave-One-Regime-Out split (Regime 2 held out as test):
+    Leave-One-Regime-Out split.
 
-      Train / Val  →  Regime 1 (batches 1-30, recipe-driven), 80/20 random
-      Test         →  Regime 2 (batches 31-60, operator-controlled)
+    Train / Val  →  Regime 1 (batches 1-30, recipe-driven), 80/20 random
+    Test         →  ``test_regime``
+                      2 → Regime 2 (batches 31-60, operator-controlled)
+                      3 → Regime 3 (batches 61-90, APC closed-loop)
 
     Faulty batches (91-100) are excluded; they remain available via
     dm.batches_fault if needed separately.
     """
     import numpy as np
 
+    _TEST_IDS = {
+        2: _REGIME_2_IDS,
+        3: _REGIME_3_IDS,
+    }
+    _TEST_LABELS = {
+        2: "Regime 2, operator-controlled",
+        3: "Regime 3, APC closed-loop",
+    }
+    if test_regime not in _TEST_IDS:
+        raise ValueError(f"test_regime must be 2 or 3, got {test_regime}")
+
     regime1 = [
         b for b in dm.batches_clean
         if b["_batch_id"].iloc[0] in _REGIME_1_IDS
     ]
-    regime2 = [
+    test_b = [
         b for b in dm.batches_clean
-        if b["_batch_id"].iloc[0] in _REGIME_2_IDS
+        if b["_batch_id"].iloc[0] in _TEST_IDS[test_regime]
     ]
 
     rng     = np.random.default_rng(seed)
@@ -65,19 +78,19 @@ def _regime_ablation_splits(dm, seed: int = 42):
     n_train = int(len(regime1) * 0.80)
     train_b = [regime1[i] for i in perm[:n_train]]
     val_b   = [regime1[i] for i in perm[n_train:]]
-    test_b  = regime2
 
     print(
         f"  [regime-ablation]  Train: {len(train_b)} (Regime 1 80%)  |  "
         f"Val: {len(val_b)} (Regime 1 20%)  |  "
-        f"Test: {len(test_b)} (Regime 2, operator-controlled)"
+        f"Test: {len(test_b)} ({_TEST_LABELS[test_regime]})"
     )
     return train_b, val_b, test_b
 
 
 ALL_MODELS = [
     "pi_lstm", "neural_ode",
-    "cdae_pi_lstm", "cvae_pi_lstm", "pca_pi_lstm", "pls_pi_lstm",
+    "cdae_pi_lstm", "cvae_pi_lstm", "beta_vae_pi_lstm",
+    "pca_pi_lstm", "pls_pi_lstm",
     "delta_cdae_pi_lstm", "cdae_process_pi_lstm", "process_pi_lstm",
 ]
 
@@ -86,6 +99,7 @@ DEFAULT_CKPTS = {
     "neural_ode":             "./checkpoints/neural_ode.pt",
     "cdae_pi_lstm":           "./checkpoints/cdae_pi_lstm.pt",
     "cvae_pi_lstm":           "./checkpoints/cvae_pi_lstm.pt",
+    "beta_vae_pi_lstm":       "./checkpoints/beta_vae_pi_lstm.pt",
     "pca_pi_lstm":            "./checkpoints/pca_pi_lstm.pt",
     "pls_pi_lstm":            "./checkpoints/pls_pi_lstm.pt",
     "delta_cdae_pi_lstm":     "./checkpoints/delta_cdae_pi_lstm.pt",
@@ -105,6 +119,7 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
     ----------------------------------------
         cdae_v2  -> CDAERamanEncoderV2  (64-d)
         cvae_v2  -> CVAERamanEncoderV2  (64-d, posterior mean)
+        beta_vae -> BetaVAERamanEncoderV2 (64-d, posterior mean)
         pca_v2   -> PCARamanEncoderV1   (K-d, fit by pca_baseline.py)
         pls_v2   -> PLSRamanEncoderV1   (K-d, fit by pls_baseline.py)
     """
@@ -137,6 +152,17 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
         from src.data.cvae_encoder import CVAERamanEncoderV2
         print(f"  Loading CVAERamanEncoderV2 from {ckpt_path}  (scaler: {scaler_path}) ...")
         return CVAERamanEncoderV2(ckpt_path, scaler_path, device)
+
+    if enc_type == "beta_vae":
+        ckpt_path   = ckpt_path   or "./checkpoints/beta_vae_best.pt"
+        scaler_path = scaler_path or "./checkpoints/beta_vae_scaler.joblib"
+        if not Path(ckpt_path).exists():
+            raise FileNotFoundError(f"β-VAE checkpoint not found: {ckpt_path}")
+        if not Path(scaler_path).exists():
+            raise FileNotFoundError(f"β-VAE scaler not found: {scaler_path}")
+        from src.data.beta_vae_encoder import BetaVAERamanEncoderV2
+        print(f"  Loading BetaVAERamanEncoderV2 from {ckpt_path}  (scaler: {scaler_path}) ...")
+        return BetaVAERamanEncoderV2(ckpt_path, scaler_path, device)
 
     if enc_type == "pca_v2":
         ckpt_path   = ckpt_path   or "./checkpoints/pca_best.joblib"
@@ -206,7 +232,8 @@ def _patch_portable_paths(cfg) -> None:
         cfg.data["csv_path"] = _DEFAULT_CSV
 
 
-def _load_data(cfg, device: torch.device, regime_ablation: bool = False):
+def _load_data(cfg, device: torch.device, regime_ablation: bool = False,
+               test_regime: int = 2):
     """Return ``(train_b, val_b, test_b)`` using the split stored in cfg."""
     import random
     import numpy as np
@@ -223,7 +250,7 @@ def _load_data(cfg, device: torch.device, regime_ablation: bool = False):
     dm.load()
 
     if regime_ablation:
-        return _regime_ablation_splits(dm, seed=seed)
+        return _regime_ablation_splits(dm, seed=seed, test_regime=test_regime)
 
     strategy   = cfg.data.get("split_strategy", "random")
     train_frac = float(cfg.data.get("train_frac", 0.80))
@@ -236,6 +263,7 @@ def _evaluate_one(
     device:     torch.device,
     save_plots: bool = False,
     regime_ablation: bool = False,
+    test_regime: int = 2,
 ) -> Optional[Dict]:
     """Load checkpoint, reload data, run ``evaluate()`` on val + test splits."""
     if not Path(ckpt_path).exists():
@@ -251,12 +279,18 @@ def _evaluate_one(
     alg = BaseAlgorithm.load(ckpt_path, device)
     cfg = alg.cfg
 
-    _, val_b, test_b = _load_data(cfg, device, regime_ablation=regime_ablation)
+    _, val_b, test_b = _load_data(cfg, device, regime_ablation=regime_ablation,
+                                   test_regime=test_regime)
 
     from src.evaluation.metrics import print_metrics_table
 
+    _test_regime_labels = {
+        2: "Test (Regime 2, operator-controlled):",
+        3: "Test (Regime 3, APC closed-loop):",
+    }
     val_label  = "Val (Regime 1 holdout):" if regime_ablation else "Val (fault-free):"
-    test_label = "Test (Regime 2, operator):" if regime_ablation else "Test (faulty):"
+    test_label = _test_regime_labels.get(test_regime, f"Test (Regime {test_regime}):") \
+                 if regime_ablation else "Test (faulty):"
 
     print(f"  {val_label}")
     val_m = alg.evaluate(val_b)
@@ -350,8 +384,17 @@ def main() -> None:
         "--regime-ablation", action="store_true", dest="regime_ablation",
         help=(
             "Leave-One-Regime-Out evaluation: val on Regime 1 holdout "
-            "(batches 1-30), test on Regime 2 (batches 31-60, operator-controlled). "
+            "(batches 1-30), test set chosen by --test-regime. "
             "Overrides the default fault-free val / faulty test split."
+        ),
+    )
+    parser.add_argument(
+        "--test-regime", type=int, default=2, dest="test_regime",
+        choices=[2, 3],
+        help=(
+            "Which regime to use as the test set when --regime-ablation is active. "
+            "2 = Regime 2 (batches 31-60, operator-controlled, default). "
+            "3 = Regime 3 (batches 61-90, APC closed-loop)."
         ),
     )
     args = parser.parse_args()
@@ -377,6 +420,7 @@ def main() -> None:
             model_name, ckpt_path, device,
             save_plots=args.plots,
             regime_ablation=args.regime_ablation,
+            test_regime=args.test_regime,
         )
         all_results[model_name] = res
         if res is not None and args.scatter:

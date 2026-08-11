@@ -1,17 +1,36 @@
-# Dossiers d'environnement virtuel
-.venv/
-venv/
-env/
-ENV/
-
-# Cache Python
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+.venv/
+*.egg-info/
 
-# Fichiers de configuration de l'IDE (optionnel mais recommandé)
+# Data — too large for git
+*.csv
+
+# Trained weights and fitted encoders
+checkpoints/*.pt
+checkpoints/*.joblib
+checkpoints/*.npz
+checkpoints/beta_sweep/
+!checkpoints/.gitkeep
+
+# Runtime artifacts
+*.log
+*.pid
+
+# Generated outputs — exclude everything except final result JSONs and benchmark
+outputs/
+!outputs/benchmark/
+!outputs/benchmark/**
+!outputs/beta_sweep_e2e/
+!outputs/beta_sweep_e2e/sweep_results.json
+!outputs/sindyc/
+!outputs/sindyc/sweep_results.json
+!outputs/neural_cde/
+!outputs/neural_cde/ncde_summary.json
+
+# IDE / OS
 .vscode/
 .idea/
 .DS_Store
-
-./100_Batches_IndPenSim_V3.csv

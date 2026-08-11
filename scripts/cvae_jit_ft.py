@@ -128,22 +128,115 @@ if str(_ROOT) not in sys.path:
 import src.algorithms  # noqa: F401  — side-effect: populates REGISTRY
 from src.algorithms.base import BaseAlgorithm
 from src.algorithms.cvae_pi_lstm import CVAEPILSTMAlgorithm
+import src.algorithms.beta_vae_pi_lstm  # noqa: F401 — registers BetaVAEPILSTMAlgorithm
+from src.autoencoder.model import CVAE_Raman, BetaVAE_Raman
 from src.data.dataset import RAMAN_START_COL_IDX, TARGET_COLS
 from src.evaluation.metrics import compute_metrics
 from src.physics.losses import compute_cdae_pinn_loss
 
 # Reuse the encoder + preprocessing + CSV-split helpers from vae_jitl.py
-# (identical pipeline: clamp -> SG(d=1,w=15,p=2) -> StandardScaler -> CVAE)
+# (identical pipeline: clamp -> SG(d=1,w=15,p=2) -> StandardScaler -> encoder)
 from vae_jitl import VAEJITLEncoder, VAR_FLOOR, _load_and_split_csv
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 N_RAMAN_COLS      = 2001
 DEFAULT_K         = 150
-DEFAULT_LOCAL_LR  = 5e-3
+DEFAULT_LOCAL_LR  = 2e-5
 DEFAULT_N_EPOCHS  = 8
 DEFAULT_CKPT      = "./checkpoints/cvae_pi_lstm.pt"     # GLOBAL model checkpoint
 DEFAULT_DB_CACHE  = "./checkpoints/cvae_jit_ft_db.npz"
 SEED              = 42
+
+# Regime-ablation batch-ID ranges (0-indexed).  Batches 0-29 = R1, etc.
+REGIME_IDS = {
+    "R1":    range(0,  30),
+    "R2":    range(30, 60),
+    "R3":    range(60, 90),
+    "Fault": range(90, 100),
+}
+
+# Per-model defaults (encoder ckpt, encoder scaler, global LSTM ckpt, DB cache)
+MODEL_DEFAULTS = {
+    "cvae": {
+        "encoder_ckpt":       "./checkpoints/cvae_best.pt",
+        "encoder_scaler":     "./checkpoints/cvae_scaler.joblib",
+        "global_ckpt":        "./checkpoints/cvae_pi_lstm.pt",
+        "db_cache":           "./checkpoints/cvae_jit_ft_db.npz",
+        "regime_global_ckpt": "./checkpoints/cvae_pi_lstm_regime_ablation.pt",
+        "regime_db_cache":    "./checkpoints/cvae_jit_ft_db_r1.npz",
+        "model_class":        CVAE_Raman,
+        "label":              "CVAE-PI-LSTM",
+    },
+    "beta_vae": {
+        "encoder_ckpt":       "./checkpoints/beta_vae_best.pt",
+        "encoder_scaler":     "./checkpoints/beta_vae_scaler.joblib",
+        "global_ckpt":        "./checkpoints/beta_vae_pi_lstm.pt",
+        "db_cache":           "./checkpoints/beta_vae_jit_ft_db.npz",
+        "regime_global_ckpt": "./checkpoints/beta_vae_pi_lstm_regime_ablation.pt",
+        "regime_db_cache":    "./checkpoints/beta_vae_jit_ft_db_r1.npz",
+        "model_class":        BetaVAE_Raman,
+        "label":              "\u03b2-VAE-PI-LSTM",
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regime-ablation CSV loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_regime_split_csv(
+    csv_path:      str,
+    min_batch_len: int = 50,
+) -> Dict[str, List[pd.DataFrame]]:
+    """
+    Load IndPenSim V3 and return batches keyed by regime name.
+
+    Returns
+    -------
+    {"R1": [...], "R2": [...], "R3": [...], "Fault": [...]}
+
+    Batch IDs are 0-indexed (time-reset detection).  Mapping:
+        R1    → ids  0–29   (recipe-driven)
+        R2    → ids 30–59   (operator-controlled)
+        R3    → ids 60–89   (APC closed-loop)
+        Fault → ids 90–99   (fault injection)
+    """
+    from src.data.dataset import FAULT_COL
+    print(f"Loading CSV (regime split): {csv_path} ...")
+    df = pd.read_csv(csv_path)
+    print(f"  Shape: {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+    # ── Batch boundary detection (time resets) ────────────────────────────
+    t_vals    = df["Time (h)"].values
+    batch_ids = np.zeros(len(df), dtype=np.int32)
+    bid = 0
+    for i in range(1, len(df)):
+        if t_vals[i] < t_vals[i - 1]:
+            bid += 1
+        batch_ids[i] = bid
+    df["_batch_id"] = batch_ids
+
+    # ── Sparse target preservation + dense interpolation ─────────────────
+    df["_penicillin_sparse"] = df[TARGET_COLS[1]].copy()
+    df["_biomass_sparse"]    = df[TARGET_COLS[0]].copy()
+    for tc in TARGET_COLS:
+        df[tc] = df[tc].interpolate(method="linear").ffill().bfill()
+
+    buckets: Dict[str, List[pd.DataFrame]] = {k: [] for k in REGIME_IDS}
+
+    for b_id in range(int(df["_batch_id"].max()) + 1):
+        b = df[df["_batch_id"] == b_id].copy().reset_index(drop=True)
+        if len(b) < min_batch_len:
+            continue
+        for regime, id_range in REGIME_IDS.items():
+            if b_id in id_range:
+                buckets[regime].append(b)
+                break
+
+    for regime, batches in buckets.items():
+        print(f"  {regime}: {len(batches)} batches")
+
+    return buckets
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -528,6 +621,7 @@ class CVAE_JIT_PI_LSTM_Predictor:
         confidence_top_n:     int   = 5,
         distance_temperature: float = 1.0,
         device:               torch.device = None,
+        model_label:          str   = "CVAE-PI-LSTM",
     ) -> None:
         assert database.is_built, "Call database.build() before creating the predictor."
         assert global_algo.model is not None, "global_algo must already be fit/loaded."
@@ -538,6 +632,7 @@ class CVAE_JIT_PI_LSTM_Predictor:
         self.local_epochs = local_epochs
         self.local_lr     = local_lr
         self.freeze_first_layer = freeze_first_layer
+        self._model_label = model_label
 
         # ── Feature A: Selective JIT-FT (confidence thresholding) ──────────
         self.confidence_threshold = confidence_threshold
@@ -812,7 +907,7 @@ class CVAE_JIT_PI_LSTM_Predictor:
         n_skipped   = 0
 
         print(f"\n{'='*64}")
-        print(f"  CVAE-PI-LSTM  JIT-FT  Evaluation")
+        print(f"  {self._model_label}  JIT-FT  Evaluation")
         print(f"  K={self.K}  local_epochs={self.local_epochs}  "
               f"local_lr={self.local_lr}  lambda_physics={self.lambda_physics:.3f}  "
               f"freeze_l0={self.freeze_first_layer}")
@@ -1030,13 +1125,29 @@ def grid_search(
 # Section F — CLI entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _print_comparison(jitft_metrics: Dict[str, float]) -> None:
-    """Print a 3-way comparison: global model vs PLS-JITL vs JIT-FT."""
+def _print_comparison(jitft_metrics: Dict[str, float], model_label: str = "CVAE-PI-LSTM") -> None:
+    """Print a 3-way comparison: global model vs PLS-JITL vs JIT-FT.
+
+    Reference numbers (trained on R1+R2+R3, evaluated on fault batches 90-99):
+      β-VAE-PI-LSTM global  : RMSE=0.1350, R²=0.9998  (beta_vae_pi_lstm.pt)
+      CDAE-PI-LSTM global   : RMSE=0.0876, R²=0.9999  (cdae_pi_lstm.pt)
+      PLS-JITL K=300        : RMSE=0.6459, R²=0.9944  (vae_jitl.py)
+      β-VAE JIT-FT K=150 lr=2e-5 (optimal): RMSE=0.1345, R²=0.9998
+
+    Regime-ablation (train R1, test fault):
+      β-VAE-LSTM     : 0.269
+      β-VAE-PI-LSTM  : 0.289
+      CDAE-PI-LSTM   : 0.741
+      PLS-PI-LSTM    : 0.634
+      β-VAE-Mamba    : 0.369
+      β-VAE-LiquidNet: 0.384
+    """
     models = [
-        ("CVAE-PI-LSTM (global)",      0.1350, 0.9998),
+        ("β-VAE-PI-LSTM (global)",     0.1350, 0.9998),
         ("CDAE-PI-LSTM (global)",      0.0876, 0.9999),
         ("VAE-JITL PLS K=300 (local)", 0.6459, 0.9944),
     ]
+    jitft_label = f"{model_label} JIT-FT (local)"
     print(f"\n{'='*64}")
     print(f"  Global vs Local (PLS-JITL) vs Local (JIT-FT)  —  Test (fault)")
     print(f"{'='*64}")
@@ -1045,21 +1156,26 @@ def _print_comparison(jitft_metrics: Dict[str, float]) -> None:
     for name, rmse, r2 in models:
         print(f"  {name:<32}  {rmse:>12.4f}  {r2:>10.6f}")
     print(f"  {'─'*58}")
-    print(f"  {'CVAE-PI-LSTM JIT-FT (local)':<32}  "
+    print(f"  {jitft_label:<32}  "
           f"{jitft_metrics['RMSE']:>12.4f}  {jitft_metrics['R2']:>10.6f}")
     print(f"{'='*64}\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="CVAE-PI-LSTM Just-In-Time Fine-Tuning (JIT-FT) evaluation"
+        description="CVAE/beta-VAE PI-LSTM Just-In-Time Fine-Tuning (JIT-FT) evaluation"
     )
+    parser.add_argument("--model",       default="cvae", choices=["cvae", "beta_vae"],
+                        help="Which encoder/global model to use (default: cvae)")
     parser.add_argument("--csv",         default="./100_Batches_IndPenSim_V3.csv")
-    parser.add_argument("--global-ckpt", default=DEFAULT_CKPT,
-                        help="Path to the pre-trained GLOBAL cvae_pi_lstm.pt")
-    parser.add_argument("--cvae-ckpt",   default="./checkpoints/cvae_best.pt")
-    parser.add_argument("--cvae-scaler", default="./checkpoints/cvae_scaler.joblib")
-    parser.add_argument("--db-cache",    default=DEFAULT_DB_CACHE)
+    parser.add_argument("--global-ckpt", default=None,
+                        help="Path to pre-trained GLOBAL PI-LSTM (default: model-specific)")
+    parser.add_argument("--cvae-ckpt",   default=None,
+                        help="Path to encoder checkpoint (default: model-specific)")
+    parser.add_argument("--cvae-scaler", default=None,
+                        help="Path to encoder StandardScaler (default: model-specific)")
+    parser.add_argument("--db-cache",    default=None,
+                        help="Path to window DB cache (default: model-specific)")
     parser.add_argument("--rebuild-db",  action="store_true")
     parser.add_argument("--K",              type=int,   default=DEFAULT_K)
     parser.add_argument("--local-epochs",   type=int,   default=DEFAULT_N_EPOCHS)
@@ -1080,6 +1196,12 @@ def main() -> None:
                              "weighted local loss (default 1.0)")
     parser.add_argument("--max-queries",    type=int, default=None,
                         help="Cap total query points (fast smoke test)")
+    parser.add_argument("--split",          default="test", choices=["val", "test"],
+                        help="Which split to evaluate on: val (clean held-out) "
+                             "or test (fault batches, default)")
+    parser.add_argument("--regime-ablation", action="store_true",
+                        help="Train DB on R1 only; evaluate separately on R2, R3, Fault "
+                             "using the regime-ablation global checkpoint")
     parser.add_argument("--grid-search",    action="store_true",
                         help="Run the Feature C nested grid search over "
                              "K=[200,250,300] x confidence_threshold=[0.1,0.5,1.0,inf] "
@@ -1092,35 +1214,65 @@ def main() -> None:
     np.random.seed(args.seed)
     random.seed(args.seed)
 
+    # ── Resolve model-specific defaults ──────────────────────────────────────
+    defs        = MODEL_DEFAULTS[args.model]
+    model_label = defs["label"]
+    if args.regime_ablation:
+        global_ckpt = args.global_ckpt or defs["regime_global_ckpt"]
+        db_cache    = args.db_cache    or defs["regime_db_cache"]
+    else:
+        global_ckpt = args.global_ckpt or defs["global_ckpt"]
+        db_cache    = args.db_cache    or defs["db_cache"]
+    enc_ckpt    = args.cvae_ckpt   or defs["encoder_ckpt"]
+    enc_scaler  = args.cvae_scaler or defs["encoder_scaler"]
+    model_class = defs["model_class"]
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
+    print(f"\nModel  : {model_label}{'  [regime-ablation]' if args.regime_ablation else ''}")
+    print(f"Device : {device}")
 
     # ── 1. Load the GLOBAL model (weights frozen, read-only from here on) ──
-    print(f"\n[1] Loading GLOBAL CVAE-PI-LSTM from {args.global_ckpt} ...")
-    global_algo: CVAEPILSTMAlgorithm = BaseAlgorithm.load(args.global_ckpt, device)
+    print(f"\n[1] Loading GLOBAL {model_label} from {global_ckpt} ...")
+    global_algo: CVAEPILSTMAlgorithm = BaseAlgorithm.load(global_ckpt, device)
     global_algo.model.eval()
     for p in global_algo.model.parameters():
-        p.requires_grad_(False)   # belt-and-braces: global model never trains again
+        p.requires_grad_(False)
     print(f"  Global model loaded. dt_n={global_algo._dt_n:.6f}  "
           f"(recomputed at fit time; re-derived below for DB build consistency)")
 
-    # ── 2. Load CVAE encoder (exposes mu AND log_var) ───────────────────────
-    print(f"\n[2] Loading CVAE encoder ...")
+    # ── 2. Load encoder (exposes mu AND log_var) ────────────────────────────
+    print(f"\n[2] Loading {model_label} encoder ...")
     encoder = VAEJITLEncoder(
-        ckpt_path=args.cvae_ckpt, scaler_path=args.cvae_scaler, device=device,
+        ckpt_path=enc_ckpt, scaler_path=enc_scaler, device=device,
+        model_class=model_class,
     )
 
     seq_len = int(global_algo.cfg.training.seq_len)
 
     # ── 3. Load / build the window database ─────────────────────────────────
     db = JITFTWindowDatabase()
-    db_path = Path(args.db_cache)
+    db_path = Path(db_cache)
 
-    train_batches, _, test_batches = _load_and_split_csv(args.csv, seed=args.seed)
+    if args.regime_ablation:
+        # ── Regime-ablation path ─────────────────────────────────────────
+        regime_batches = _load_regime_split_csv(args.csv)
+        train_batches  = regime_batches["R1"]          # DB built from R1 only
+        eval_regime_map = {
+            "R2":    regime_batches["R2"],
+            "R3":    regime_batches["R3"],
+            "Fault": regime_batches["Fault"],
+        }
+    else:
+        # ── Standard path ───────────────────────────────────────────────
+        train_batches, val_batches, test_batches = _load_and_split_csv(
+            args.csv, seed=args.seed)
+        eval_batches = val_batches if args.split == "val" else test_batches
+        split_label  = ("Val (clean held-out)" if args.split == "val"
+                        else "Test (fault batches)")
+        print(f"  Eval split : {split_label}  ({len(eval_batches)} batches)")
 
-    # Recompute dt_n exactly as CVAEPILSTMAlgorithm._fit_scalers does, using
-    # the SAME training batches (guarantees identical value to the one used
-    # for the original global training run).
+    # Recompute dt_n using the training batches (R1 for regime-ablation,
+    # all 72 for the standard path) to match the original training run.
     t_all   = np.concatenate([b["Time (h)"].values for b in train_batches])
     t_range = float(t_all.max() - t_all.min())
     global_algo._dt_n = float(global_algo.cfg.training.dt) / max(t_range, 1e-8)
@@ -1142,7 +1294,7 @@ def main() -> None:
         db.save(str(db_path))
 
     # ── 4. Build JIT-FT predictor ────────────────────────────────────────────
-    print(f"\n[4] Initialising CVAE_JIT_PI_LSTM_Predictor ...")
+    print(f"\n[4] Initialising JIT-FT predictor ...")
     predictor = CVAE_JIT_PI_LSTM_Predictor(
         global_algo=global_algo,
         database=db,
@@ -1155,27 +1307,52 @@ def main() -> None:
         confidence_top_n=args.confidence_top_n,
         distance_temperature=args.distance_temperature,
         device=device,
+        model_label=model_label,
     )
 
-    # ── 5. Evaluate (single run OR full grid search) ────────────────────────
-    if args.grid_search:
+    # ── 5. Evaluate ──────────────────────────────────────────────────────────
+    if args.regime_ablation:
+        # ── Regime-ablation: evaluate R2, R3, Fault separately ───────────
+        print(f"\n[5] Running JIT-FT regime-ablation evaluation (R2 / R3 / Fault) ...")
+        regime_metrics: Dict[str, Dict] = {}
+        for regime_name, batches in eval_regime_map.items():
+            print(f"\n  ── Regime: {regime_name} ({len(batches)} batches) ──")
+            m = predictor.evaluate(
+                batches, encoder, global_algo.scalers.feat, seq_len,
+                max_queries=args.max_queries, verbose=True,
+            )
+            regime_metrics[regime_name] = m
+
+        # ── Summary table ────────────────────────────────────────────────
+        print(f"\n{'='*72}")
+        print(f"  {model_label} JIT-FT — Regime-Ablation Summary")
+        print(f"  (train DB: R1, K={args.K}, lr={args.local_lr}, epochs={args.local_epochs})")
+        print(f"{'='*72}")
+        print(f"  {'Regime':<8}  {'RMSE (g/L)':>12}  {'MAE (g/L)':>12}  {'R²':>10}  {'N':>5}")
+        print(f"  {'─'*56}")
+        for regime_name, m in regime_metrics.items():
+            print(f"  {regime_name:<8}  {m['RMSE']:>12.4f}  {m['MAE']:>12.4f}  "
+                  f"{m['R2']:>10.6f}  {m['n']:>5}")
+        print(f"{'='*72}\n")
+
+    elif args.grid_search:
         print(f"\n[5] Running Feature C grid search "
               f"(K x confidence_threshold) ...")
         grid_search(
-            predictor, test_batches, encoder, global_algo.scalers.feat, seq_len,
+            predictor, eval_batches, encoder, global_algo.scalers.feat, seq_len,
             k_values=[200, 250, 300],
             confidence_thresholds=[0.1, 0.5, 1.0, float("inf")],
             max_queries=args.max_queries,
         )
     else:
-        print(f"\n[5] Running JIT-FT evaluation ...")
+        print(f"\n[5] Running JIT-FT evaluation on {split_label} ...")
         metrics = predictor.evaluate(
-            test_batches, encoder, global_algo.scalers.feat, seq_len,
+            eval_batches, encoder, global_algo.scalers.feat, seq_len,
             max_queries=args.max_queries, verbose=True,
         )
 
         # ── 6. Comparison ───────────────────────────────────────────────────
-        _print_comparison(metrics)
+        _print_comparison(metrics, model_label=model_label)
 
 
 if __name__ == "__main__":

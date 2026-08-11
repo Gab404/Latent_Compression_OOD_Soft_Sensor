@@ -1,0 +1,64 @@
+# configs/beta_vae_mamba_regime_ablation.yaml
+# ===========================================
+# β-VAE-Mamba Regime-Ablation — same Mamba architecture as
+# beta_vae_mamba.yaml but trained exclusively on Regime 1 (batches 1-30,
+# recipe-driven) and evaluated on Regime 2, Regime 3, and Faulty batches.
+#
+# Use with:  --model beta_vae_mamba --regime-ablation --no-early-stopping
+#
+# Split (driven by train.py --regime-ablation flag, not by config):
+#   Train / Val → Regime 1 (batches 1-30), 80/20 random, seed=42
+#   Test R2     → Regime 2 (batches 31-60, operator-controlled)
+#   Test R3     → Regime 3 (batches 61-90, APC closed-loop)
+#   Test Fault  → Faulty   (batches 91-100)
+
+name: beta_vae_mamba_regime_ablation
+
+data:
+  csv_path:           ./100_Batches_IndPenSim_V3.csv
+  use_raman:          true
+  raman_encoder_type: beta_vae
+  raman_ckpt:         ./checkpoints/beta_vae_best.pt
+  raman_scaler:       ./checkpoints/beta_vae_scaler.joblib
+  raman_latent_dim:   64
+
+  split_strategy:     random   # overridden by --regime-ablation at runtime
+  train_frac:         0.80
+  seed:               42
+  min_len:            50
+
+model:
+  d_model:          64
+  num_mamba_layers: 2
+  d_state:          16
+  d_conv:           4
+  expand:           2
+  fc_hidden:        32
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2    # unused (no physics params), kept for compat
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  # Physics fully disabled
+  vanilla_mode:          true
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.0
+  lambda_anneal_delay:   0
+  lambda_anneal_epochs:  1
+
+output:
+  checkpoint: ./checkpoints/beta_vae_mamba_regime_ablation.pt
+  plots_dir:  ./outputs/beta_vae_mamba_regime_ablation/

@@ -182,6 +182,96 @@ def compute_cdae_pinn_loss(
 # Delta-CDAE-PI-LSTM loss  (ΔP prediction, simplified mass-balance physics)
 # ── ─────────────────────────────────────────────────────────────────────────
 
+def compute_latent_lp_loss(
+    model,                  # BetaVAELatentLPModel — provides model.alpha, model.beta, model.latent_bio_idx
+    pred:           torch.Tensor,   # (B, T, 1)  pen_norm predictions
+    x_input:        torch.Tensor,   # (B, T, D)  MinMaxScaled β-VAE latent input to the LSTM
+    y_pen_norm:     torch.Tensor,   # (B, T)     normalised Penicillin targets
+    dt_n:           float,          # normalised time step (dt_physical / time_range)
+    lambda_physics: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Latent Luedeking-Piret Physics-Informed loss for β-VAE-PI-LSTM.
+
+    Eliminates the "trivial solution" trap by replacing the unconstrained
+    ``r_net`` head with a constraint anchored to the real biomass signal
+    already encoded in the β-VAE latent space (z38, index 37).
+
+    ODE (discretised)
+    -----------------
+        ΔP_phy = (α · ΔX_latent + β · X_latent) · dt_n
+
+    where
+        X_latent = x_input[:, :, latent_bio_idx]   (biomass-correlated dim, |r|=0.99)
+        ΔX_latent = X_latent[:, 1:] - X_latent[:, :-1]
+        ΔP_pred   = pen_norm[:, 1:] - pen_norm[:, :-1]
+
+    Loss components
+    ---------------
+    Data loss   : MSE(pen_norm_pred, y_pen_norm)          (NaN-masked)
+    Physics loss: MSE(ΔP_pred, ΔP_phy)
+
+    Unlike compute_cdae_pinn_loss, there is no free r_net: the ODE rhs is
+    entirely determined by the input latent trajectory, making it impossible
+    for the network to trivially zero out the residual by outputting a
+    matching r_net.
+
+    Parameters
+    ----------
+    model          : BetaVAELatentLPModel
+    pred           : (B, T, 1)  pen_norm predictions
+    x_input        : (B, T, D)  MinMaxScaled latent input (same tensor as fed to LSTM)
+    y_pen_norm     : (B, T)     normalised penicillin targets
+    dt_n           : normalised time step
+    lambda_physics : weight for physics residual term
+
+    Returns
+    -------
+    loss      : scalar total loss
+    loss_dict : breakdown dict for logging
+    """
+    pen_pred = pred[:, :, 0]   # (B, T)
+
+    # ── Data loss (NaN-masked) ────────────────────────────────────────────────
+    valid_pen = ~torch.isnan(y_pen_norm)
+    l_data = (
+        F.mse_loss(pen_pred[valid_pen], y_pen_norm[valid_pen])
+        if valid_pen.any()
+        else pred.new_tensor(0.0)
+    )
+
+    # ── Latent Luedeking-Piret physics residual ───────────────────────────────
+    if lambda_physics > 0.0:
+        alpha = model.alpha   # scalar > 0
+        beta  = model.beta    # scalar > 0
+
+        # Extract biomass-correlated latent dimension (z38 = index 37)
+        X_lat = x_input[:, :, model.latent_bio_idx]   # (B, T)
+
+        # Finite differences along time axis
+        dP_pred = pen_pred[:, 1:] - pen_pred[:, :-1]  # (B, T-1)  predicted ΔP
+        dX_lat  = X_lat[:, 1:]    - X_lat[:, :-1]     # (B, T-1)  latent ΔX
+
+        # Luedeking-Piret ODE prediction in normalised space
+        dP_phy = (alpha * dX_lat + beta * X_lat[:, :-1]) * dt_n   # (B, T-1)
+
+        l_phys = F.mse_loss(dP_pred, dP_phy)
+    else:
+        l_phys = pred.new_tensor(0.0)
+
+    loss = l_data + lambda_physics * l_phys
+
+    loss_dict = {
+        "loss":       float(loss.item()),
+        "loss_data":  float(l_data.item()),
+        "loss_phys":  float((lambda_physics * l_phys).item()),
+        "loss_phys_raw": float(l_phys.item()),   # unweighted, for diagnostics
+        "alpha":      float(model.alpha.item()),
+        "beta":       float(model.beta.item()),
+    }
+    return loss, loss_dict
+
+
 def compute_delta_cdae_pinn_loss(
     model,                  # DeltaCDAEPILSTMModel — provides model.k_prod
     pred:           torch.Tensor,   # (B, T, 2)  [:,:,0]=delta_pen_norm  [:,:,1]=r_net

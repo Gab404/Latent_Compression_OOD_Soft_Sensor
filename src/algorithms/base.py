@@ -297,8 +297,19 @@ class BaseAlgorithm(ABC):
 
             if verbose:
                 star = "*" if improved else " "
+
+                def _fmt(v: float) -> str:
+                    """Auto-scale: scientific for very small/large, fixed otherwise."""
+                    if v == 0.0:
+                        return "0.000000"
+                    a = abs(v)
+                    if a < 1e-4 or a >= 1e4:
+                        return f"{v:.3e}"
+                    return f"{v:.6f}"
+
                 extras_str = "  ".join(
-                    f"{k}={v:.4f}" for k, v in list(train_metrics.items())[:3]
+                    f"{k}={_fmt(v)}" for k, v in train_metrics.items()
+                    if k not in ("lambda_phys",)   # skip noisy scalar, already implied
                 )
                 print(
                     f"  {star} Ep {epoch:4d}/{n_epochs}"

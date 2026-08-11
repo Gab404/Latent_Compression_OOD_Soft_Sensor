@@ -97,8 +97,14 @@ def _regime_ablation_splits(dm, seed: int = 42):
 
 MODEL_NAMES = [
     "pi_lstm", "neural_ode",
-    "cdae_pi_lstm", "cvae_pi_lstm", "pca_pi_lstm", "pls_pi_lstm",
+    "cdae_pi_lstm", "cvae_pi_lstm", "beta_vae_pi_lstm",
+    "pca_pi_lstm", "pls_pi_lstm",
     "delta_cdae_pi_lstm", "cdae_process_pi_lstm", "process_pi_lstm",
+    "beta_vae_lp_pi_lstm",
+    "beta_vae_lstm",
+    "beta_vae_latent_lp_pi_lstm",
+    "beta_vae_mamba",
+    "beta_vae_liquid",
 ]
 
 
@@ -123,6 +129,7 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
     ----------------------------------------
         cdae_v2  -> src.data.cdae_encoder.CDAERamanEncoderV2  (64-d)
         cvae_v2  -> src.data.cvae_encoder.CVAERamanEncoderV2  (64-d, posterior mean)
+        beta_vae -> src.data.beta_vae_encoder.BetaVAERamanEncoderV2 (64-d, posterior mean)
         pca_v2   -> src.data.pca_encoder.PCARamanEncoderV1    (K-d, fit by pca_baseline.py)
         pls_v2   -> src.data.pls_encoder.PLSRamanEncoderV1    (K-d, fit by pls_baseline.py)
 
@@ -160,6 +167,17 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
         from src.data.cvae_encoder import CVAERamanEncoderV2
         print(f"  Loading CVAERamanEncoderV2 from {ckpt_path}  (scaler: {scaler_path}) ...")
         return CVAERamanEncoderV2(ckpt_path, scaler_path, device)
+
+    if enc_type == "beta_vae":
+        ckpt_path   = ckpt_path   or "./checkpoints/beta_vae_best.pt"
+        scaler_path = scaler_path or "./checkpoints/beta_vae_scaler.joblib"
+        if not Path(ckpt_path).exists():
+            raise FileNotFoundError(f"β-VAE checkpoint not found: {ckpt_path}")
+        if not Path(scaler_path).exists():
+            raise FileNotFoundError(f"β-VAE scaler not found: {scaler_path}")
+        from src.data.beta_vae_encoder import BetaVAERamanEncoderV2
+        print(f"  Loading BetaVAERamanEncoderV2 from {ckpt_path}  (scaler: {scaler_path}) ...")
+        return BetaVAERamanEncoderV2(ckpt_path, scaler_path, device)
 
     if enc_type == "pca_v2":
         ckpt_path   = ckpt_path   or "./checkpoints/pca_best.joblib"
@@ -256,6 +274,13 @@ def main() -> None:
             "Overrides the train_frac / split_strategy from config."
         ),
     )
+    parser.add_argument(
+        "--no-early-stopping", action="store_true", dest="no_early_stopping",
+        help=(
+            "Disable early stopping and run for the full n_epochs. "
+            "Overrides es_patience from the config."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -314,19 +339,43 @@ def main() -> None:
 
     # ── Train ────────────────────────────────────────────────────────────────
     print("\n[3] Training ...")
+    if args.no_early_stopping:
+        cfg.training.es_patience = int(cfg.training.n_epochs) + 1
+        print(f"  [no-early-stopping] es_patience set to {cfg.training.es_patience}")
     history = alg.fit(train_b, val_b, verbose=True)
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     print("\n[4] Evaluating ...")
     from src.evaluation.metrics import print_metrics_table
 
-    print("  --- Val (fault-free) ---")
+    val_label  = "Val (Regime 1 holdout)" if args.regime_ablation else "Val (fault-free)"
+    test_label = "Test (Regime 2)"        if args.regime_ablation else "Test (faulty)"
+
+    print(f"  --- {val_label} ---")
     val_metrics = alg.evaluate(val_b)
     print_metrics_table(val_metrics, label="Val")
 
-    print("  --- Test (faulty) ---")
+    print(f"  --- {test_label} ---")
     test_metrics = alg.evaluate(test_b)
-    print_metrics_table(test_metrics, label="Test")
+    print_metrics_table(test_metrics, label="R2" if args.regime_ablation else "Test")
+
+    # ── Extra regime evaluation (only when --regime-ablation) ─────────────────
+    r3_metrics    = None
+    fault_metrics = None
+    if args.regime_ablation:
+        regime3_b = [
+            b for b in dm.batches_clean
+            if b["_batch_id"].iloc[0] in _REGIME_3_IDS
+        ]
+        fault_b = dm.batches_fault
+
+        print("  --- Test (Regime 3, APC closed-loop) ---")
+        r3_metrics = alg.evaluate(regime3_b)
+        print_metrics_table(r3_metrics, label="R3")
+
+        print("  --- Test (Faulty batches 91-100) ---")
+        fault_metrics = alg.evaluate(fault_b)
+        print_metrics_table(fault_metrics, label="Fault")
 
     # ── Save checkpoint ───────────────────────────────────────────────────────
     print("\n[5] Saving checkpoint ...")
@@ -334,7 +383,12 @@ def main() -> None:
     os.makedirs(Path(ckpt_path).parent, exist_ok=True)
     alg.save(
         ckpt_path,
-        extra={"val_metrics": val_metrics, "test_metrics": test_metrics},
+        extra={
+            "val_metrics":   val_metrics,
+            "test_metrics":  test_metrics,
+            "r3_metrics":    r3_metrics,
+            "fault_metrics": fault_metrics,
+        },
     )
 
     # ── Plots ─────────────────────────────────────────────────────────────────
@@ -354,10 +408,14 @@ def main() -> None:
             title=f"{args.model} — training history",
         )
 
-        for split_name, batches, res in [
-            ("val",  val_b,  val_metrics),
-            ("test", test_b, test_metrics),
-        ]:
+        eval_splits = [("val", val_b, val_metrics), ("r2", test_b, test_metrics)]
+        if args.regime_ablation:
+            eval_splits += [
+                ("r3",    regime3_b, r3_metrics),
+                ("fault", fault_b,   fault_metrics),
+            ]
+
+        for split_name, batches, res in eval_splits:
             for tgt in ["bio", "pen"]:
                 tgt_label = "Biomass (g/L)" if tgt == "bio" else "Penicillin (g/L)"
                 m = res.get(tgt, {})
@@ -378,7 +436,10 @@ def main() -> None:
     print(f"\n{'=' * 65}")
     print(f"  {args.model} training complete.")
     print_metrics_table(val_metrics,  label="Val ")
-    print_metrics_table(test_metrics, label="Test")
+    print_metrics_table(test_metrics, label="R2  " if args.regime_ablation else "Test")
+    if args.regime_ablation:
+        print_metrics_table(r3_metrics,    label="R3  ")
+        print_metrics_table(fault_metrics, label="Fault")
     print(f"{'=' * 65}\n")
 
 

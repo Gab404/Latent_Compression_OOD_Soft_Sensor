@@ -110,7 +110,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.autoencoder.model import CVAE_Raman
+from src.autoencoder.model import CVAE_Raman, BetaVAE_Raman
 from src.data.dataset import (
     FAULT_COL, PROCESS_FEATURE_COLS, RAMAN_START_COL_IDX, TARGET_COLS,
 )
@@ -371,8 +371,8 @@ class VAEJITLDatabase:
 
 class VAEJITLEncoder:
     """
-    Thin wrapper around a frozen CVAE_Raman that exposes the full posterior
-    (mu, log_var) rather than only mu.
+    Thin wrapper around a frozen CVAE_Raman (or BetaVAE_Raman) that exposes
+    the full posterior (mu, log_var) rather than only mu.
 
     The standard CVAERamanEncoderV2 discards log_var at inference because the
     downstream PI-LSTM only needs mu.  JITL needs σ² for the SKL metric.
@@ -383,7 +383,7 @@ class VAEJITLEncoder:
         → _clean_raman()           clamp NaN / negatives
         → _apply_sg()              Savitzky-Golay 1st derivative
         → StandardScaler.transform()
-        → CVAE_Raman.encode()      → (mu, log_var)  each (N, D)
+        → encoder.encode()         → (mu, log_var)  each (N, D)
     """
 
     def __init__(
@@ -392,16 +392,20 @@ class VAEJITLEncoder:
         scaler_path:  str,
         device:       torch.device,
         encode_batch: int = 1024,
+        model_class   = None,   # CVAE_Raman or BetaVAE_Raman; default CVAE_Raman
     ) -> None:
         self.device       = device
         self.encode_batch = encode_batch
 
-        # ── Load CVAE model (frozen) ───────────────────────────────────────
+        if model_class is None:
+            model_class = CVAE_Raman
+
+        # ── Load encoder model (frozen) ────────────────────────────────────
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         input_length = int(state.get("input_length", N_RAMAN_COLS))
         latent_dim   = int(state.get("latent_dim",   LATENT_DIM))
 
-        self._model = CVAE_Raman(
+        self._model = model_class(
             input_length=input_length,
             latent_dim=latent_dim,
         ).to(device)
@@ -415,6 +419,7 @@ class VAEJITLEncoder:
         self._scaler: StandardScaler = joblib.load(scaler_path)
 
         print(f"  VAEJITLEncoder loaded | "
+              f"model={model_class.__name__}  "
               f"input={input_length}  latent={latent_dim}  device={device}")
 
     @torch.no_grad()

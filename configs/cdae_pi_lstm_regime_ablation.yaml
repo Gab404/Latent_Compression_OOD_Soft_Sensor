@@ -1,0 +1,66 @@
+# configs/cdae_pi_lstm_regime_ablation.yaml
+# ==========================================
+# CDAE-PI-LSTM Regime-Ablation — same physics-informed architecture as
+# cdae_pi_lstm.yaml but trained exclusively on Regime 1 (batches 1-30,
+# recipe-driven) and evaluated on Regime 2, Regime 3, and Faulty batches.
+#
+# Use with:  --model cdae_pi_lstm --regime-ablation --no-early-stopping
+#
+# Split (driven by train.py --regime-ablation flag):
+#   Train / Val → Regime 1 (batches 1-30), 80/20 random, seed=42
+#   Test R2     → Regime 2 (batches 31-60, operator-controlled)
+#   Test R3     → Regime 3 (batches 61-90, APC closed-loop)
+#   Test Fault  → Faulty   (batches 91-100)
+#
+# Encoder: frozen CDAE (64D latent, non-linear CNN autoencoder)
+# Prerequisite: checkpoints/cdae_best.pt and checkpoints/cdae_scaler.joblib
+
+name: cdae_pi_lstm_regime_ablation
+
+data:
+  csv_path:           ./100_Batches_IndPenSim_V3.csv
+  use_raman:          true
+  raman_encoder_type: cdae_v2
+  raman_ckpt:         ./checkpoints/cdae_best.pt
+  raman_scaler:       ./checkpoints/cdae_scaler.joblib
+  raman_latent_dim:   64
+
+  split_strategy:     random   # overridden by --regime-ablation at runtime
+  train_frac:         0.80
+  seed:               42
+  min_len:            50
+
+model:
+  hidden_size:      64
+  num_lstm_layers:  2
+  fc_hidden:        32
+  lstm_dropout:     0.2
+  k_prod_init:      1.0
+
+training:
+  seq_len:      24
+  dt:           0.2
+  batch_size:   64
+  n_epochs:     200
+
+  lr:           1.0e-3
+  lr_physics:   1.0e-2
+  weight_decay: 1.0e-4
+
+  lr_factor:    0.5
+  lr_patience:  15
+
+  es_patience:  30
+
+  grad_clip:    5.0
+
+  # Physics annealing — same schedule as global cdae_pi_lstm.yaml
+  vanilla_mode:          false
+  lambda_physics_start:  0.0
+  lambda_physics_end:    0.1
+  lambda_anneal_delay:   30
+  lambda_anneal_epochs:  80
+
+output:
+  checkpoint: ./checkpoints/cdae_pi_lstm_regime_ablation.pt
+  plots_dir:  ./outputs/cdae_pi_lstm_regime_ablation/
