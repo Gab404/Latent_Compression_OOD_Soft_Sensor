@@ -23,7 +23,12 @@ from src.algorithms.beta_vae_lp_pi_lstm  import BetaVAELPPILSTMAlgorithm    # no
 from src.algorithms.beta_vae_lstm        import BetaVAELSTMAlgorithm         # noqa: F401
 from src.algorithms.beta_vae_latent_lp_pi_lstm import BetaVAELatentLPPILSTMAlgorithm  # noqa: F401
 from src.algorithms.beta_vae_mamba        import BetaVAEMambaAlgorithm           # noqa: F401
-from src.algorithms.beta_vae_liquid       import BetaVAELiquidAlgorithm          # noqa: F401
+
+# Optional: ncps (Liquid Neural Networks) may not be installed
+try:
+    from src.algorithms.beta_vae_liquid   import BetaVAELiquidAlgorithm          # noqa: F401
+except ImportError:
+    pass  # ncps not installed — beta_vae_liquid will not be available
 
 
 def get_algorithm(name: str) -> type:

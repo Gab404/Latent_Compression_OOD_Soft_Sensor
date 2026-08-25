@@ -81,6 +81,7 @@ FAULT_FREE_IDS = set(range(90))
 #   substrate (glucose, DO2, pH)
 #   environmental setpoints (T, RPM, aeration)
 #   reactor state (vessel volume)
+#   temporal progression (normalised batch time)
 PHYSICAL_FACTORS: Dict[str, str] = {
     "Penicillin (g/L)":    "Penicillin concentration(P:g/L)",
     "Glucose (g/L)":       "Substrate concentration(S:g/L)",
@@ -92,6 +93,7 @@ PHYSICAL_FACTORS: Dict[str, str] = {
     "Agitator (RPM)":      "Agitator RPM(RPM:RPM)",
     "CO2 offgas (%)":      "carbon dioxide percent in off-gas(CO2outgas:%)",
     "O2 offgas (%)":       "Oxygen in percent in off-gas(O2:O2  (%))",
+    "Batch Time (norm)":   "__TIME_NORM__",   # computed per-batch, not a CSV column
 }
 
 # Encoder definitions
@@ -290,9 +292,16 @@ def load_data(
     df_ff = df[mask_ff & mask_raman].copy().reset_index(drop=True)
     print(f"[DATA]  Fault-free rows with Raman: {len(df_ff):,}")
 
+    # ── Compute normalised batch time (min-max to [0,1] per batch) ──────────
+    df_ff["__TIME_NORM__"] = df_ff.groupby("_batch_id")["Time (h)"].transform(
+        lambda t: (t - t.min()) / (t.max() - t.min() + 1e-12)
+    )
+
     # ── Interpolate dense targets (some physical cols have NaNs) ──────────────
     factor_cols = list(PHYSICAL_FACTORS.values())
     for col in factor_cols:
+        if col == "__TIME_NORM__":
+            continue          # already computed, no NaNs
         df_ff[col] = df_ff[col].interpolate(method="linear").ffill().bfill()
 
     # ── Subsample ─────────────────────────────────────────────────────────────

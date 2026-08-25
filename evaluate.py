@@ -264,6 +264,7 @@ def _evaluate_one(
     save_plots: bool = False,
     regime_ablation: bool = False,
     test_regime: int = 2,
+    seed_override: Optional[int] = None,
 ) -> Optional[Dict]:
     """Load checkpoint, reload data, run ``evaluate()`` on val + test splits."""
     if not Path(ckpt_path).exists():
@@ -273,11 +274,17 @@ def _evaluate_one(
     print(f"\n{'─' * 60}")
     print(f"  Model : {model_name}")
     print(f"  Ckpt  : {ckpt_path}")
+    if seed_override is not None:
+        print(f"  Seed  : {seed_override} (override)")
 
     from src.algorithms import BaseAlgorithm
 
     alg = BaseAlgorithm.load(ckpt_path, device)
     cfg = alg.cfg
+
+    # Apply seed override to the loaded config
+    if seed_override is not None:
+        cfg.data["seed"] = seed_override
 
     _, val_b, test_b = _load_data(cfg, device, regime_ablation=regime_ablation,
                                    test_regime=test_regime)
@@ -397,6 +404,13 @@ def main() -> None:
             "3 = Regime 3 (batches 61-90, APC closed-loop)."
         ),
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help=(
+            "Override random seed for data splitting (default: from checkpoint config). "
+            "When set, also auto-resolves checkpoint path to <model>_s{seed}.pt."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device(
@@ -414,13 +428,23 @@ def main() -> None:
         if args.ckpt and len(models_to_run) == 1:
             ckpt_path = args.ckpt
         else:
-            ckpt_path = DEFAULT_CKPTS[model_name]
+            base_ckpt = DEFAULT_CKPTS[model_name]
+            # Auto-resolve seed-suffixed checkpoint
+            if args.seed is not None and base_ckpt.endswith(".pt"):
+                seeded = base_ckpt[:-3] + f"_s{args.seed}.pt"
+                if Path(seeded).exists():
+                    ckpt_path = seeded
+                else:
+                    ckpt_path = base_ckpt
+            else:
+                ckpt_path = base_ckpt
 
         res = _evaluate_one(
             model_name, ckpt_path, device,
             save_plots=args.plots,
             regime_ablation=args.regime_ablation,
             test_regime=args.test_regime,
+            seed_override=args.seed,
         )
         all_results[model_name] = res
         if res is not None and args.scatter:

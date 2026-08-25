@@ -23,7 +23,7 @@ NOTE: The preprocessing order is SG → StandardScaler, NOT the reverse.
 For each model the script:
     1. Encodes all fault-free batch rows through the frozen encoder.
     2. Computes the absolute Pearson |r| between each of the 64 latent
-       dimensions and each of the 5 physical variables.
+        dimensions and each of the 5 physical variables.
     3. Filters to "active" dimensions (max |r| across variables > threshold).
     4. Plots a 3-panel annotated heatmap (CDAE | CVAE | β-VAE).
 
@@ -322,7 +322,7 @@ def _per_model_active_dims(
     if not corr:
         return []
     mat         = np.stack(list(corr.values()), axis=0)   # (n_vars, 64)
-    max_per_dim = mat.max(axis=0)                          # (64,)
+    max_per_dim = mat.max(axis=0)                         # (64,)
     ranked      = np.argsort(max_per_dim)[::-1]           # descending
     return ranked[:top_n].tolist()
 
@@ -376,17 +376,20 @@ def plot_heatmaps(
         for key in model_keys
     }
 
-    # Fixed cell size for readability
-    CELL_W  = 0.70   # inches per latent-dim column
-    CELL_H  = 0.85   # inches per variable row
-    CBAR_W  = 0.55   # colourbar
-    LEFT_M  = 1.20   # left margin for y-axis labels
-    RIGHT_M = 0.80   # right margin + colourbar
-    GAP     = 0.30   # gap between panels
+    # Fixed cell size for readability (Adjusted for vertical layout)
+    CELL_W   = 0.70   # inches per latent-dim column
+    CELL_H   = 0.85   # inches per variable row
+    CBAR_W   = 0.80   # colorbar & right margin
+    LEFT_M   = 1.50   # left margin for y-axis labels
+    TOP_M    = 1.00   # top margin for suptitle
+    BOTTOM_M = 1.00   # bottom margin for x-labels
+    GAP      = 1.00   # vertical gap between panels
 
-    panel_w = top_n * CELL_W + 0.4
-    fig_w   = LEFT_M + n_models * panel_w + (n_models - 1) * GAP + RIGHT_M + CBAR_W
-    fig_h   = n_vars * CELL_H + 2.2    # extra height for suptitle + x-labels
+    panel_w = top_n * CELL_W
+    panel_h = n_vars * CELL_H
+    
+    fig_w   = LEFT_M + panel_w + CBAR_W
+    fig_h   = TOP_M + n_models * panel_h + (n_models - 1) * GAP + BOTTOM_M
 
     plt.rcParams.update({
         "font.family":      "DejaVu Sans",
@@ -398,11 +401,11 @@ def plot_heatmaps(
         "ytick.labelsize":  10,
     })
 
+    # Changed from 1xN to Nx1 for vertical layout
     fig, axes = plt.subplots(
-        1, n_models,
+        n_models, 1,
         figsize=(fig_w, fig_h),
-        sharey=True,
-        gridspec_kw={"wspace": 0.06},
+        gridspec_kw={"hspace": GAP / panel_h},
     )
     if n_models == 1:
         axes = [axes]
@@ -471,11 +474,15 @@ def plot_heatmaps(
     # ── Shared colourbar ──────────────────────────────────────────────────────
     fig.subplots_adjust(
         left   = LEFT_M / fig_w,
-        right  = 1.0 - (RIGHT_M + CBAR_W) / fig_w,
-        top    = 0.82,
-        bottom = 0.18,
+        right  = 1.0 - CBAR_W / fig_w,
+        top    = 1.0 - TOP_M / fig_h,
+        bottom = BOTTOM_M / fig_h,
     )
-    cax  = fig.add_axes([1.0 - (CBAR_W - 0.1) / fig_w, 0.18, 0.018, 0.64])
+    
+    # Vertically stretch the colorbar relative to the full figure bounds
+    cax_width = 0.15 / fig_w
+    cax_left = 1.0 - (CBAR_W * 0.7) / fig_w
+    cax  = fig.add_axes([cax_left, BOTTOM_M / fig_h, cax_width, 1.0 - (TOP_M + BOTTOM_M) / fig_h])
     cbar = fig.colorbar(im_ref, cax=cax)
     cbar.set_label("|Pearson r|", fontsize=10, labelpad=8)
     cbar.ax.tick_params(labelsize=9)
@@ -487,7 +494,7 @@ def plot_heatmaps(
         f"Top {top_n} latent dims per model  (sorted by max |r|)  "
         f"·  Variables shown: max |r| > {min_var_r}",
         fontsize=11,
-        y=0.97,
+        y=1.0 - (TOP_M * 0.3) / fig_h,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)

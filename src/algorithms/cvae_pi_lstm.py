@@ -328,6 +328,16 @@ class CVAEPILSTMAlgorithm(BaseAlgorithm):
         if pen_true:
             pen_t_cat = np.concatenate(pen_true)
             pen_p_cat = np.concatenate(pen_pred_list)
+
+            # ── UNIT DIAGNOSTIC (TODO #6) ─────────────────────────────────
+            print(f"  [UNIT CHECK] y_true: min={pen_t_cat.min():.4f}  "
+                  f"max={pen_t_cat.max():.4f}  "
+                  f"y_pred: min={pen_p_cat.min():.4f}  "
+                  f"max={pen_p_cat.max():.4f}")
+            # If max(y_true) ≈ 0–1 → still in scaled space (BUG).
+            # If max(y_true) ≈ 30–40 → confirmed g/L (correct).
+            # ──────────────────────────────────────────────────────────────
+
             pen_metrics = compute_metrics(pen_t_cat, pen_p_cat)
         else:
             pen_metrics = {"RMSE": float("nan"), "MAE": float("nan"),

@@ -281,6 +281,14 @@ def main() -> None:
             "Overrides es_patience from the config."
         ),
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help=(
+            "Override the random seed (default: from config, usually 42). "
+            "Also appends '_s{seed}' to the checkpoint filename for "
+            "multi-seed experiments."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -291,6 +299,7 @@ def main() -> None:
     print(f"\n{'=' * 65}")
     print(f"  Model  : {args.model}")
     print(f"  Device : {device}")
+    print(f"  Seed   : {args.seed if args.seed is not None else 'config default'}")
     print(f"{'=' * 65}\n")
 
     # ── Config ────────────────────────────────────────────────────────────────
@@ -303,6 +312,21 @@ def main() -> None:
         cfg.training.n_epochs = args.epochs
     if args.ckpt is not None:
         cfg.output.checkpoint = args.ckpt
+
+    # Seed override — also patch checkpoint/plots paths to avoid collisions
+    if args.seed is not None:
+        cfg.data["seed"] = args.seed
+        suffix = f"_s{args.seed}"
+        # Auto-rename checkpoint: foo.pt → foo_s{seed}.pt
+        if args.ckpt is None:
+            ckpt_base = str(cfg.output.checkpoint)
+            if ckpt_base.endswith(".pt"):
+                cfg.output["checkpoint"] = ckpt_base[:-3] + suffix + ".pt"
+            else:
+                cfg.output["checkpoint"] = ckpt_base + suffix
+        # Auto-rename plots dir
+        plots_base = str(cfg.output.plots_dir).rstrip("/")
+        cfg.output["plots_dir"] = plots_base + suffix
 
     seed = int(cfg.data.get("seed", 42))
     _set_seed(seed)
