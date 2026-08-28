@@ -21,7 +21,7 @@ training:
   seg_len:      50
   seg_stride:   10
   dt:           0.2
-  batch_size:   64
+  batch_size:   256
   n_epochs:     150
   lr:           1.0e-3
   weight_decay: 1.0e-4

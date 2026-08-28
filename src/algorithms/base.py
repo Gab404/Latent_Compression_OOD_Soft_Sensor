@@ -101,6 +101,9 @@ class BaseAlgorithm(ABC):
         self.scalers:   Optional[ScalerBundle]         = None
         self._history:  Dict[str, list]                = {}
         self._optimizer: Optional[torch.optim.Optimizer] = None
+        # AMP flag — set to True in fit() when device is CUDA.
+        # Subclasses read this in _train_epoch / _val_epoch.
+        self._use_amp: bool = False
 
     # ── Abstract interface ────────────────────────────────────────────────────
 
@@ -216,19 +219,47 @@ class BaseAlgorithm(ABC):
             print("[fit] Fitting scalers ...")
         self.scalers = self._fit_scalers(train_batches)
 
-        # 2 — Datasets + DataLoaders
+        # 2 — Datasets
         if verbose:
             print("[fit] Building datasets ...")
         train_ds = self._build_dataset(train_batches, self.scalers)
         val_ds   = self._build_dataset(val_batches,   self.scalers)
 
+        # AMP: use bfloat16 on CUDA (no GradScaler needed — same exponent range as fp32)
+        self._use_amp = (self.device.type == "cuda")
+
+        # Pre-move the entire dataset to GPU VRAM once, eliminating per-batch
+        # host→device transfers. The whole training set is ≈90 MB for the largest
+        # models, well within the 6 GB VRAM budget.
+        if self.device.type == "cuda":
+            train_ds = TensorDataset(
+                *(t.to(self.device, non_blocking=True) for t in train_ds.tensors)
+            )
+            val_ds = TensorDataset(
+                *(t.to(self.device, non_blocking=True) for t in val_ds.tensors)
+            )
+            # GPU-resident tensors → no workers or pinning needed
+            loader_kw: dict = {"num_workers": 0, "pin_memory": False}
+        else:
+            # CPU path: background workers overlap preprocessing with GPU compute
+            loader_kw = {
+                "num_workers":       4,
+                "pin_memory":        True,
+                "persistent_workers": True,
+                "prefetch_factor":   2,
+            }
+
         bs = int(tr.batch_size)
         train_loader = DataLoader(
-            train_ds, batch_size=bs, shuffle=True,  num_workers=0, pin_memory=True
+            train_ds, batch_size=bs, shuffle=True,  **loader_kw
         )
         val_loader = DataLoader(
-            val_ds,   batch_size=bs, shuffle=False, num_workers=0, pin_memory=True
+            val_ds,   batch_size=bs, shuffle=False, **loader_kw
         )
+        if verbose:
+            amp_tag = "bfloat16 AMP" if self._use_amp else "float32"
+            gpu_tag = "GPU-resident" if self.device.type == "cuda" else "CPU"
+            print(f"[fit] DataLoader: batch={bs}, {gpu_tag} dataset, {amp_tag}")
 
         # 3 — Model
         if verbose:

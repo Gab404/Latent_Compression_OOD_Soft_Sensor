@@ -289,6 +289,18 @@ def main() -> None:
             "multi-seed experiments."
         ),
     )
+    parser.add_argument(
+        "--raman-ckpt", default=None, dest="raman_ckpt",
+        help=(
+            "Override the Raman encoder checkpoint path from config "
+            "(e.g. a per-seed encoder trained by train_autoencoder.py / "
+            "pca_baseline.py / pls_baseline.py)."
+        ),
+    )
+    parser.add_argument(
+        "--raman-scaler", default=None, dest="raman_scaler",
+        help="Override the Raman encoder scaler path from config.",
+    )
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -312,6 +324,12 @@ def main() -> None:
         cfg.training.n_epochs = args.epochs
     if args.ckpt is not None:
         cfg.output.checkpoint = args.ckpt
+
+    # Per-seed Raman encoder overrides (for multi-seed encoder retraining)
+    if args.raman_ckpt is not None:
+        cfg.data["raman_ckpt"] = args.raman_ckpt
+    if args.raman_scaler is not None:
+        cfg.data["raman_scaler"] = args.raman_scaler
 
     # Seed override — also patch checkpoint/plots paths to avoid collisions
     if args.seed is not None:

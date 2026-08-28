@@ -48,7 +48,7 @@ model:
 training:
   seq_len:      24
   dt:           0.2                        # physical time step (h)
-  batch_size:   64
+  batch_size:   512
   n_epochs:     200
 
   # Optimizer

@@ -311,20 +311,30 @@ def train_beta_vae_r1(
     device:        torch.device,
     n_epochs:      int = VAE_N_EPOCHS,
     seed:          int = SEED,
+    anneal_delay:  int = 0,
+    anneal_epochs: int = 1,
 ) -> Dict[str, float]:
     """
-    Train BetaVAE_Raman on Regime 1 spectra with a FIXED β (no annealing).
+    Train BetaVAE_Raman on Regime 1 spectra.
+
+    anneal_delay=0, anneal_epochs=1  →  fixed β from epoch 1 (original behaviour)
+    anneal_delay=20, anneal_epochs=100 →  β ramps 0→target over epochs 20-120
+        (same schedule as run_seeds.py / train_autoencoder.py, strongly reduces
+        the probability of dimensional collapse at low β values such as 0.05).
+
+    Early stopping tracks val reconstruction MSE.
+    When annealing, ES is frozen during the β=0 warmup and ramp phases
+    (only becomes active after β has reached its target value).
 
     Returns final best {val_recon_mse, val_kl, epoch}.
-    The checkpoint is saved only once β≥max_beta (i.e., from epoch 1 since
-    we use a fixed β), tracking reconstruction MSE for early stopping and
-    checkpointing — identical logic to train_autoencoder.train_beta_vae
-    with anneal_epochs=1.
     """
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
 
+    use_anneal = (anneal_delay > 0 or anneal_epochs > 1)
+    anneal_str = (f"anneal delay={anneal_delay} ramp={anneal_epochs}"
+                  if use_anneal else "fixed")
     print(f"\n{'─'*60}")
-    print(f"  β-VAE encoder  β={beta:.4f}  device={device}")
+    print(f"  β-VAE encoder  β={beta:.4f}  device={device}  schedule={anneal_str}")
     print(f"{'─'*60}")
 
     # ── Prepare spectra ────────────────────────────────────────────────────
@@ -350,11 +360,32 @@ def train_beta_vae_r1(
                  optim, mode="min", factor=VAE_LR_FACTOR,
                  patience=VAE_LR_PAT, verbose=False)
 
-    best_recon = float("inf")
-    no_improve = 0
+    best_recon    = float("inf")
+    no_improve    = 0
+    beta_fully_on = False   # ES frozen until β has reached its target
     Path(ckpt_out).parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, n_epochs + 1):
+        # ── β schedule ────────────────────────────────────────────────────────
+        if not use_anneal:
+            beta_now = beta
+            beta_fully_on = True
+        else:
+            epoch_after_delay = epoch - anneal_delay
+            if epoch_after_delay <= 0:
+                beta_now = 0.0
+            elif anneal_epochs <= 1:
+                beta_now = beta
+            else:
+                frac = min((epoch_after_delay - 1) / (anneal_epochs - 1), 1.0)
+                beta_now = beta * frac
+            if not beta_fully_on and beta_now >= beta - 1e-9:
+                beta_fully_on = True
+                best_recon    = float("inf")   # reset ES when β is fully ramped
+                no_improve    = 0
+                print(f"  ep {epoch}: β reached target ({beta:.4f}) — "
+                      f"ES and checkpointing now active", flush=True)
+
         # ── Train epoch ───────────────────────────────────────────────────
         model.train()
         tr_recon = tr_kl = 0.0
@@ -362,8 +393,8 @@ def train_beta_vae_r1(
             x = x.to(device)
             optim.zero_grad()
             recon, mu, lv = model(x)
-            _, rec, kl    = _beta_vae_loss(recon, x, mu, lv, beta)
-            loss = rec + beta * kl
+            _, rec, kl    = _beta_vae_loss(recon, x, mu, lv, beta_now)
+            loss = rec + beta_now * kl
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), VAE_GRAD_CLIP)
             optim.step()
@@ -379,7 +410,7 @@ def train_beta_vae_r1(
             for (x,) in dl_va:
                 x = x.to(device)
                 recon, mu, lv = model(x)
-                _, rec, kl    = _beta_vae_loss(recon, x, mu, lv, beta)
+                _, rec, kl    = _beta_vae_loss(recon, x, mu, lv, beta_now)
                 va_recon += rec.item() * len(x)
                 va_kl    += kl.item()  * len(x)
         Nv = len(dl_va.dataset)
@@ -388,13 +419,13 @@ def train_beta_vae_r1(
         sched.step(va_recon)
 
         if epoch % 20 == 0 or epoch == 1:
-            print(f"  ep {epoch:4d}/{n_epochs}  "
+            print(f"  ep {epoch:4d}/{n_epochs}  β_now={beta_now:.4f}  "
                   f"tr_rec={tr_recon:.5f} tr_kl={tr_kl:.4f}  "
                   f"va_rec={va_recon:.5f} va_kl={va_kl:.4f}  "
-                  f"lr={optim.param_groups[0]['lr']:.1e}")
+                  f"lr={optim.param_groups[0]['lr']:.1e}", flush=True)
 
-        # ── Checkpoint on reconstruction improvement ───────────────────────
-        if va_recon < best_recon - 1e-7:
+        # ── Checkpoint on reconstruction improvement (only after β is fully on)
+        if beta_fully_on and va_recon < best_recon - 1e-7:
             best_recon = va_recon
             no_improve = 0
             torch.save({
@@ -406,10 +437,10 @@ def train_beta_vae_r1(
                 "latent_dim":       LATENT_DIM,
                 "beta":             beta,
             }, ckpt_out)
-        else:
+        elif beta_fully_on:
             no_improve += 1
             if no_improve >= VAE_ES_PAT:
-                print(f"  Early stop at epoch {epoch}.")
+                print(f"  Early stop at epoch {epoch}.", flush=True)
                 break
 
     joblib.dump(scaler, scaler_out)
@@ -985,6 +1016,8 @@ def run_sweep(
     seq_len:      Optional[int] = None,
     vae_src_root: Optional[Path] = None,
     seed:         int  = SEED,
+    vae_anneal_delay:  int = 0,
+    vae_anneal_epochs: int = 1,
 ) -> None:
     """Main sweep loop."""
     out_root.mkdir(parents=True, exist_ok=True)
@@ -1067,6 +1100,8 @@ def run_sweep(
             vae_metrics = train_beta_vae_r1(
                 r1_train, r1_val, vae_ckpt, vae_scaler, beta, device,
                 n_epochs=vae_epochs, seed=seed,
+                anneal_delay=vae_anneal_delay,
+                anneal_epochs=vae_anneal_epochs,
             )
             row.update({"val_recon_mse": vae_metrics["val_recon_mse"],
                         "val_kl":        vae_metrics["val_kl"],
@@ -1299,6 +1334,16 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed",   type=int, default=SEED)
+    parser.add_argument(
+        "--vae-anneal-delay", type=int, default=0,
+        help="Epochs to keep β=0 before annealing (default 0 = fixed β). "
+             "Use 20 to match run_seeds.py protocol.",
+    )
+    parser.add_argument(
+        "--vae-anneal-epochs", type=int, default=1,
+        help="Epochs to ramp β from 0 to target (default 1 = fixed β). "
+             "Use 100 to match run_seeds.py protocol.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1320,6 +1365,8 @@ def main() -> None:
         seq_len      = args.seq_len,
         vae_src_root = Path(args.vae_src_dir) if args.vae_src_dir else None,
         seed         = args.seed,
+        vae_anneal_delay  = args.vae_anneal_delay,
+        vae_anneal_epochs = args.vae_anneal_epochs,
     )
 
 

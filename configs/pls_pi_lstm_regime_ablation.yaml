@@ -41,7 +41,7 @@ model:
 training:
   seq_len:      24
   dt:           0.2
-  batch_size:   64
+  batch_size:   512
   n_epochs:     200
 
   lr:           1.0e-3

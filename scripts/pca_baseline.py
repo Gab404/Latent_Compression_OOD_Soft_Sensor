@@ -741,59 +741,68 @@ def print_comparison_table(
 # MAIN
 # -- ------------------------------------------------------------------------
 
-def main(csv_path: str = CSV_PATH) -> None:
+def main(
+    csv_path:        str  = CSV_PATH,
+    seed:            int  = SPLIT_SEED,
+    pca_ckpt_path:   str  = None,
+    scaler_ckpt_path: str = None,
+    regime_ablation: bool = False,
+) -> None:
     """
-    End-to-end PCA-PCR baseline pipeline:
-      1.  Load & SG-preprocess raw Raman data
-      2.  Split into train / FF-val / fault-test (random split, seed=42)
-      3.  10-fold GroupKFold cross-validation on calibration set  -> RMSECV
-      4.  Fit final PCR pipeline on all calibration batches
-      5.  Evaluate on FF-val and fault batches
-      6.  Print benchmark comparison table
-      7.  Save fitted Pipeline to CHECKPOINT_PATH
-      8.  Save standalone StandardScaler + PCA as encoder artefacts (for
-          downstream PCA-PI-LSTM training via src/data/pca_encoder.py)
+    End-to-end PCA-PCR baseline pipeline.
+
+    regime_ablation=True  →  use only R1 (batches 0-29) for training,
+                             matching Protocol 2 of the benchmark.
     """
-    # -- 1. Load data ------------------------------------------------------
+    # -- 1. Load data ----------------------------------------------------------
     batches = load_batches(csv_path)
 
-    # -- 2. Split ----------------------------------------------------------
-    train_batches, val_batches, fault_batches = split_batches(batches)
+    # -- 2. Optionally restrict to R1 only (Protocol 2) -----------------------
+    if regime_ablation:
+        r1_ids = set(range(30))
+        batches_for_split = [b for b in batches if b.get("batch_id", 999) in r1_ids
+                             or not b["is_fault"]]
+        # fall back: filter by position in clean list
+        clean_all = [b for b in batches if not b["is_fault"]]
+        batches_for_split = clean_all[:30] + [b for b in batches if b["is_fault"]]
+    else:
+        batches_for_split = batches
 
-    # -- 3. Build flat training arrays ------------------------------------
-    # use_dense_targets=True: supervise on all time-steps with interpolated P,
-    # consistent with how PLS and CDAE-PI-LSTM are trained.
+    # -- 3. Split --------------------------------------------------------------
+    train_batches, val_batches, fault_batches = split_batches(
+        batches_for_split, seed=seed
+    )
+
+    # -- 4. Build flat training arrays -----------------------------------------
     X_train, y_train, groups = build_flat_arrays(train_batches, use_dense_targets=True)
     print(f"\n[DATA]  Training set: X={X_train.shape}  y={y_train.shape}  "
           f"n_groups={len(np.unique(groups))}")
 
-    # -- 4. Cross-validation -----------------------------------------------
+    # -- 5. Cross-validation ---------------------------------------------------
     rmsecv, _ = run_cross_validation(X_train, y_train, groups)
 
-    # -- 5. Fit final model ------------------------------------------------
+    # -- 6. Fit final model ----------------------------------------------------
     pcr = fit_pcr(X_train, y_train)
 
-    # -- 6. Evaluate -- FF-val ---------------------------------------------
+    # -- 7. Evaluate -- FF-val -------------------------------------------------
     ffval_metrics = evaluate_split(pcr, val_batches, split_name="FF-Validation")
 
-    # -- 7. Evaluate -- fault batches --------------------------------------
+    # -- 8. Evaluate -- fault batches ------------------------------------------
     fault_mean_rmse, per_batch = evaluate_fault_batches(pcr, fault_batches)
 
-    # -- 8. Benchmark summary ----------------------------------------------
+    # -- 9. Benchmark summary --------------------------------------------------
     evr = pcr.named_steps["pca"].explained_variance_ratio_
     print_comparison_table(rmsecv, ffval_metrics, fault_mean_rmse, per_batch, evr)
 
-    # -- 9. Save model -----------------------------------------------------
+    # -- 10. Save model --------------------------------------------------------
     metadata = {
-        # Hyperparameters
         "n_components":  N_COMPONENTS,
         "n_raman_cols":  N_RAMAN_COLS,
         "sg_window":     SG_WINDOW,
         "sg_poly":       SG_POLY,
         "sg_deriv":      SG_DERIV,
         "train_frac":    TRAIN_FRAC,
-        "split_seed":    SPLIT_SEED,
-        # Results
+        "split_seed":    seed,
         "rmsecv":        rmsecv,
         "ffval_rmse":    ffval_metrics.get("RMSE"),
         "ffval_r2":      ffval_metrics.get("R2"),
@@ -805,8 +814,10 @@ def main(csv_path: str = CSV_PATH) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     save_model(pcr, CHECKPOINT_PATH, metadata)
 
-    # -- 10. Save encoder artefacts (consumed by PCA-PI-LSTM) -------------
-    save_encoder_artefacts(pcr, PCA_MODEL_PATH, PCA_SCALER_PATH)
+    # -- 11. Save encoder artefacts (consumed by PCA-PI-LSTM) -----------------
+    pca_out    = Path(pca_ckpt_path)    if pca_ckpt_path    else PCA_MODEL_PATH
+    scaler_out = Path(scaler_ckpt_path) if scaler_ckpt_path else PCA_SCALER_PATH
+    save_encoder_artefacts(pcr, pca_out, scaler_out)
 
 
 # -- CLI entry-point --------------------------------------------------------
@@ -816,11 +827,23 @@ if __name__ == "__main__":
         description="PCA-PCR baseline for ReaKt-v2 Penicillin soft-sensor benchmark.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--csv",
-        type=str,
-        default=CSV_PATH,
-        help="Path to the IndPenSim V3 CSV file.",
-    )
+    parser.add_argument("--csv",    type=str, default=CSV_PATH,
+                        help="Path to the IndPenSim V3 CSV file.")
+    parser.add_argument("--seed",   type=int, default=SPLIT_SEED,
+                        help="Random seed for the 80/20 train/val split.")
+    parser.add_argument("--ckpt",   type=str, default=None,
+                        help="Output path for the PCA encoder (.joblib). "
+                             "Default: checkpoints/pca_best.joblib")
+    parser.add_argument("--scaler", type=str, default=None,
+                        help="Output path for the StandardScaler (.joblib). "
+                             "Default: checkpoints/pca_scaler.joblib")
+    parser.add_argument("--regime-ablation", action="store_true",
+                        help="Train on R1 only (batches 0-29), mirroring Protocol 2.")
     args = parser.parse_args()
-    main(csv_path=args.csv)
+    main(
+        csv_path        = args.csv,
+        seed            = args.seed,
+        pca_ckpt_path   = args.ckpt,
+        scaler_ckpt_path = args.scaler,
+        regime_ablation = args.regime_ablation,
+    )

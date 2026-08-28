@@ -174,7 +174,7 @@ class CVAEPILSTMAlgorithm(BaseAlgorithm):
         """
         feat_cols = self._feature_cols()
         seq_len   = int(self.cfg.training.seq_len)
-        X_list, y_list = [], []
+        X_parts, y_parts = [], []
 
         for b in batches:
             feats = scalers.feat.transform(
@@ -185,14 +185,24 @@ class CVAEPILSTMAlgorithm(BaseAlgorithm):
             ).flatten().astype(np.float32)
 
             T = len(feats)
-            for i in range(T - seq_len + 1):
-                X_list.append(feats[i : i + seq_len])
-                y_list.append(pen_n[i : i + seq_len])
+            if T < seq_len:
+                continue
 
-        X = torch.tensor(np.array(X_list, dtype=np.float32))
-        y = torch.tensor(np.array(y_list, dtype=np.float32))
+            # Vectorised sliding windows — no Python loop, O(1) allocations
+            n_feat = feats.shape[1]
+            X_win = np.lib.stride_tricks.sliding_window_view(
+                feats, (seq_len, n_feat)
+            )[:, 0].copy()                         # (N_win, seq_len, n_feat)
+            y_win = np.lib.stride_tricks.sliding_window_view(
+                pen_n, seq_len
+            ).copy()                               # (N_win, seq_len)
+            X_parts.append(X_win)
+            y_parts.append(y_win)
+
+        X = torch.from_numpy(np.concatenate(X_parts, axis=0))
+        y = torch.from_numpy(np.concatenate(y_parts, axis=0))
         print(
-            f"  Sliding-window dataset: {len(X_list):,} windows  "
+            f"  Sliding-window dataset: {len(X):,} windows  "
             f"(seq_len={seq_len}, n_feat={X.shape[-1]})"
         )
         return TensorDataset(X, y)
@@ -202,17 +212,28 @@ class CVAEPILSTMAlgorithm(BaseAlgorithm):
         loader: DataLoader,
         lambda_physics: float = 0.0,
     ) -> Dict[str, float]:
-        """One training epoch."""
+        """One training epoch with optional bfloat16 AMP on CUDA."""
         grad_clip = float(self.cfg.training.grad_clip)
+        use_amp   = self._use_amp
         ep_total, ep_data, ep_phys = [], [], []
 
         for x_b, y_b in loader:
-            x_b = x_b.to(self.device)
-            y_b = y_b.to(self.device)
+            # H2D transfer is a no-op when the dataset is GPU-resident
+            if x_b.device != self.device:
+                x_b = x_b.to(self.device, non_blocking=True)
+                y_b = y_b.to(self.device, non_blocking=True)
 
             self._optimizer.zero_grad(set_to_none=True)
 
-            pred = self.model(x_b)   # (B, T, 2): [pen_norm, r_net]
+            # Forward: run LSTM GEMMs in bfloat16 (2× Tensor Core throughput).
+            # Cast back to float32 before the physics loss to preserve residual
+            # precision (finite-difference physics terms are sensitive to rounding).
+            with torch.autocast(device_type=self.device.type,
+                                dtype=torch.bfloat16, enabled=use_amp):
+                pred = self.model(x_b)   # (B, T, 2): [pen_norm, r_net]
+            if use_amp:
+                pred = pred.float()
+
             loss, ld = compute_cdae_pinn_loss(
                 model=self.model,
                 pred=pred,
@@ -239,16 +260,22 @@ class CVAEPILSTMAlgorithm(BaseAlgorithm):
         }
 
     def _val_epoch(self, loader: DataLoader) -> float:
-        """Validation MSE on Penicillin predictions (no physics loss)."""
-        val_mses: List[float] = []
+        """Validation MSE — accumulates on GPU, one .item() call per epoch."""
+        use_amp    = self._use_amp
+        total_loss = torch.zeros(1, device=self.device)
+        n_batches  = 0
         with torch.no_grad():
             for x_b, y_b in loader:
-                x_b = x_b.to(self.device)
-                y_b = y_b.to(self.device)
-                pred = self.model(x_b)          # (B, T, 2)
-                pen_pred = pred[:, :, 0]        # (B, T)   pen_norm only
-                val_mses.append(F.mse_loss(pen_pred, y_b).item())
-        return float(np.mean(val_mses))
+                if x_b.device != self.device:
+                    x_b = x_b.to(self.device, non_blocking=True)
+                    y_b = y_b.to(self.device, non_blocking=True)
+                with torch.autocast(device_type=self.device.type,
+                                    dtype=torch.bfloat16, enabled=use_amp):
+                    pred = self.model(x_b)          # (B, T, 2)
+                pen_pred = pred[:, :, 0].float()    # (B, T) always fp32
+                total_loss += F.mse_loss(pen_pred, y_b.float())
+                n_batches  += 1
+        return (total_loss / max(n_batches, 1)).item()
 
     def evaluate(self, batches) -> Dict[str, Any]:
         """

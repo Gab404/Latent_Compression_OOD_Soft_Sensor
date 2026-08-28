@@ -20,10 +20,28 @@ Usage
 
 from __future__ import annotations
 
+import ctypes
+import gc
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+def _trim_system_memory() -> None:
+    """
+    Ask glibc to release free'd heap pages back to the OS (Linux only).
+
+    After a large pd.read_csv + Raman encoding, Python's allocator holds
+    onto the freed pages in its internal pool rather than returning them.
+    This call shrinks the process RSS to match what is actually live,
+    preventing accumulated memory pressure when multiple train.py subprocesses
+    run in parallel.
+    """
+    try:
+        ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # non-Linux or libc not available — silently skip
 
 # ── Column definitions ────────────────────────────────────────────────────────
 
@@ -135,6 +153,20 @@ class PenicillinDataModule:
             for i, col in enumerate(self._raman_latent_cols):
                 df[col] = latents[:, i]
 
+            # ── Free ~2 GB of raw Raman channels immediately ──────────────────
+            # The 2200 raw wavenumber columns are no longer needed after encoding.
+            # Dropping them now — before the per-batch .copy() loop — prevents
+            # each batch slice from carrying ~22 MB of redundant Raman data.
+            _keep = set(PROCESS_FEATURE_COLS + TARGET_COLS + [FAULT_COL]
+                        + self._raman_latent_cols)
+            _drop = [c for c in df.columns if c not in _keep]
+            if _drop:
+                df.drop(columns=_drop, inplace=True)
+            del latents, _drop, _keep
+            gc.collect()
+            _trim_system_memory()
+            print(f"  Raw Raman dropped  →  df now {df.shape[1]} columns")
+
         # Detect batch boundaries (time resets)
         t_vals    = df["Time (h)"].values
         batch_ids = np.zeros(len(df), dtype=np.int32)
@@ -188,6 +220,11 @@ class PenicillinDataModule:
         self._batches_clean = clean
         self._batches_fault = fault
         self._loaded        = True
+
+        # Release the full DataFrame — all needed data is now in the batch lists
+        del df
+        gc.collect()
+        _trim_system_memory()
 
         print(f"  Fault-free: {len(clean)}  |  Faulty: {len(fault)}")
         return self

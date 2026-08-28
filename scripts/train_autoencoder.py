@@ -117,10 +117,14 @@ def load_raman_splits(
     seed: int = SEED,
     train_frac: float = TRAIN_FRAC,
     min_batch_len: int = MIN_BATCH_LEN,
+    regime_ablation: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load the CSV, extract Raman spectra, apply the same batch split as the
     downstream LSTM training (seed=42, random, 80/20 fault-free).
+
+    regime_ablation=True  →  use only R1 (batches 0-29, ids < 30) for training,
+                             mirroring Protocol 2 (--regime-ablation) in train.py.
 
     Returns
     -------
@@ -153,8 +157,10 @@ def load_raman_splits(
     print(f"  Detected {n_batches} batches")
 
     # ── Separate fault-free / faulty batches ──────────────────────────────────
+    # Protocol 2 (regime_ablation): use only R1, i.e. batch ids 0–29
+    r1_only_ids = set(range(30)) if regime_ablation else None
+
     clean_batch_spectra: List[np.ndarray] = []
-    # faulty_batch_spectra: List[np.ndarray] = []
 
     for b_id in range(n_batches):
         mask  = batch_ids == b_id
@@ -165,6 +171,12 @@ def load_raman_splits(
             continue
 
         is_faulty = bool(np.max(fault) > 0)
+        if is_faulty:
+            continue
+
+        # Protocol 2: skip batches outside R1
+        if r1_only_ids is not None and b_id not in r1_only_ids:
+            continue
 
         # Filter to valid (non-zero energy) rows
         energy = np.abs(x_b).sum(axis=1)
@@ -173,13 +185,13 @@ def load_raman_splits(
         if len(x_valid) < 10:
             continue
 
-        if not is_faulty:
-            clean_batch_spectra.append(x_valid)
+        clean_batch_spectra.append(x_valid)
 
     n_clean = len(clean_batch_spectra)
-    print(f"  Fault-free batches with valid Raman: {n_clean}")
+    proto_tag = "R1 only (regime-ablation)" if regime_ablation else "all fault-free"
+    print(f"  Fault-free batches with valid Raman ({proto_tag}): {n_clean}")
 
-    # ── Same random 80/20 split as downstream LSTM (seed=42) ─────────────────
+    # ── Same random 80/20 split as downstream LSTM ────────────────────────────
     rng   = np.random.default_rng(seed)
     perm  = rng.permutation(n_clean)
     n_tr  = int(n_clean * train_frac)
@@ -219,16 +231,32 @@ def preprocess(
 
 
 def make_dataloaders(
-    X_train: np.ndarray,
-    X_val:   np.ndarray,
+    X_train:    np.ndarray,
+    X_val:      np.ndarray,
     batch_size: int,
+    device:     torch.device = torch.device("cpu"),
 ) -> Tuple[DataLoader, DataLoader]:
-    ds_train = TensorDataset(torch.from_numpy(X_train))
-    ds_val   = TensorDataset(torch.from_numpy(X_val))
+    """
+    Build DataLoaders.  When ``device`` is CUDA the full dataset is pre-moved
+    to GPU VRAM so per-batch H2D transfers are eliminated.
+    """
+    t_train = torch.from_numpy(X_train)
+    t_val   = torch.from_numpy(X_val)
+
+    if device.type == "cuda":
+        # Pre-move to GPU once — no H2D overhead per batch
+        t_train = t_train.to(device, non_blocking=True)
+        t_val   = t_val.to(device,   non_blocking=True)
+        loader_kw: dict = {"num_workers": 0, "pin_memory": False}
+    else:
+        loader_kw = {"num_workers": 0, "pin_memory": True}
+
+    ds_train = TensorDataset(t_train)
+    ds_val   = TensorDataset(t_val)
     dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True,
-                          num_workers=0, pin_memory=True, drop_last=False)
+                          drop_last=False, **loader_kw)
     dl_val   = DataLoader(ds_val,   batch_size=batch_size, shuffle=False,
-                          num_workers=0, pin_memory=True, drop_last=False)
+                          drop_last=False, **loader_kw)
     return dl_train, dl_val
 
 
@@ -307,6 +335,7 @@ def train_cdae(
     weight_decay: float = WEIGHT_DECAY,
     seed:        int   = SEED,
     device:      str   = "cuda",
+    regime_ablation: bool = False,
 ) -> None:
     """Train CDAE_Raman and save checkpoint + scaler."""
     torch.manual_seed(seed)
@@ -315,12 +344,14 @@ def train_cdae(
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
-    print(f"  Training CDAE  |  latent={latent_dim}  noise={noise_std}  device={dev}")
+    print(f"  Training CDAE  |  latent={latent_dim}  noise={noise_std}  device={dev}"
+          f"{'  [R1 only]' if regime_ablation else ''}")
     print(f"{'='*60}")
 
-    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed)
+    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed,
+                                               regime_ablation=regime_ablation)
     X_train, X_val, scaler = preprocess(X_train_raw, X_val_raw)
-    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size)
+    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size, dev)
 
     model = CDAE_Raman(
         input_length=N_RAMAN_COLS,
@@ -331,46 +362,53 @@ def train_cdae(
     optim   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(
                   optim, mode="min", factor=LR_FACTOR,
-                  patience=LR_PATIENCE, verbose=True)
+                  patience=LR_PATIENCE, verbose=False)
 
+    use_amp = (dev.type == "cuda")
     best_val  = float("inf")
     no_improv = 0
 
     for epoch in range(1, n_epochs + 1):
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
-        tr_loss = 0.0
+        tr_loss = torch.zeros(1, device=dev)
         for (x,) in dl_train:
-            x = x.to(dev)
-            optim.zero_grad()
-            recon = model(x)          # adds noise internally in train mode
-            loss  = cdae_loss(recon, x)
+            if x.device != dev:
+                x = x.to(dev, non_blocking=True)
+            optim.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                enabled=use_amp):
+                recon = model(x)
+            loss  = cdae_loss(recon.float(), x.float())
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optim.step()
-            tr_loss += loss.item() * len(x)
-        tr_loss /= len(dl_train.dataset)
+            tr_loss += loss.detach()
+        tr_loss_val = (tr_loss / len(dl_train)).item()
 
         # ── Validate ──────────────────────────────────────────────────────────
         model.eval()
-        va_loss = 0.0
+        va_loss = torch.zeros(1, device=dev)
         with torch.no_grad():
             for (x,) in dl_val:
-                x = x.to(dev)
-                recon = model(x)      # no noise in eval mode
-                va_loss += cdae_loss(recon, x).item() * len(x)
-        va_loss /= len(dl_val.dataset)
+                if x.device != dev:
+                    x = x.to(dev, non_blocking=True)
+                with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                    enabled=use_amp):
+                    recon = model(x)
+                va_loss += cdae_loss(recon.float(), x.float()).detach()
+        va_loss_val = (va_loss / len(dl_val)).item()
 
-        sched.step(va_loss)
+        sched.step(va_loss_val)
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{n_epochs}  "
-                  f"train={tr_loss:.6f}  val={va_loss:.6f}  "
-                  f"lr={optim.param_groups[0]['lr']:.2e}")
+                  f"train={tr_loss_val:.6f}  val={va_loss_val:.6f}  "
+                  f"lr={optim.param_groups[0]['lr']:.2e}", flush=True)
 
         # ── Early stopping / checkpoint ───────────────────────────────────────
-        if va_loss < best_val - 1e-7:
-            best_val  = va_loss
+        if va_loss_val < best_val - 1e-7:
+            best_val  = va_loss_val
             no_improv = 0
             Path(ckpt_out).parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -407,6 +445,7 @@ def train_cvae(
     weight_decay: float = WEIGHT_DECAY,
     seed:        int   = SEED,
     device:      str   = "cuda",
+    regime_ablation: bool = False,
 ) -> None:
     """Train CVAE_Raman and save checkpoint + scaler."""
     torch.manual_seed(seed)
@@ -415,12 +454,14 @@ def train_cvae(
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
-    print(f"  Training CVAE  |  latent={latent_dim}  beta={beta}  device={dev}")
+    print(f"  Training CVAE  |  latent={latent_dim}  beta={beta}  device={dev}"
+          f"{'  [R1 only]' if regime_ablation else ''}")
     print(f"{'='*60}")
 
-    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed)
+    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed,
+                                               regime_ablation=regime_ablation)
     X_train, X_val, scaler = preprocess(X_train_raw, X_val_raw)
-    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size)
+    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size, dev)
 
     model = CVAE_Raman(
         input_length=N_RAMAN_COLS,
@@ -430,56 +471,71 @@ def train_cvae(
     optim   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(
                   optim, mode="min", factor=LR_FACTOR,
-                  patience=LR_PATIENCE, verbose=True)
+                  patience=LR_PATIENCE, verbose=False)
 
+    use_amp   = (dev.type == "cuda")
     best_val  = float("inf")
     no_improv = 0
 
     for epoch in range(1, n_epochs + 1):
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
-        tr_total = tr_recon = tr_kl = 0.0
+        tr_total = torch.zeros(1, device=dev)
+        tr_recon = torch.zeros(1, device=dev)
+        tr_kl    = torch.zeros(1, device=dev)
         for (x,) in dl_train:
-            x = x.to(dev)
-            optim.zero_grad()
-            recon, mu, log_var = model(x)    # reparameterised in train mode
-            loss, rec, kl = cvae_loss(recon, x, mu, log_var, beta=beta)
+            if x.device != dev:
+                x = x.to(dev, non_blocking=True)
+            optim.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                enabled=use_amp):
+                recon, mu, log_var = model(x)
+            loss, rec, kl = cvae_loss(recon.float(), x.float(),
+                                      mu.float(), log_var.float(), beta=beta)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optim.step()
-            n = len(x)
-            tr_total += loss.item() * n
-            tr_recon += rec.item()  * n
-            tr_kl    += kl.item()   * n
-        N = len(dl_train.dataset)
-        tr_total /= N;  tr_recon /= N;  tr_kl /= N
+            tr_total += loss.detach()
+            tr_recon += rec.detach()
+            tr_kl    += kl.detach()
+        N = len(dl_train)
+        tr_total_v = (tr_total / N).item()
+        tr_recon_v = (tr_recon / N).item()
+        tr_kl_v    = (tr_kl    / N).item()
 
         # ── Validate (use mu only, no sampling) ───────────────────────────────
         model.eval()
-        va_total = va_recon = va_kl = 0.0
+        va_total = torch.zeros(1, device=dev)
+        va_recon = torch.zeros(1, device=dev)
+        va_kl    = torch.zeros(1, device=dev)
         with torch.no_grad():
             for (x,) in dl_val:
-                x = x.to(dev)
-                recon, mu, log_var = model(x)   # eval: uses mu (no sampling)
-                loss, rec, kl = cvae_loss(recon, x, mu, log_var, beta=beta)
-                n = len(x)
-                va_total += loss.item() * n
-                va_recon += rec.item()  * n
-                va_kl    += kl.item()   * n
-        Nv = len(dl_val.dataset)
-        va_total /= Nv;  va_recon /= Nv;  va_kl /= Nv
+                if x.device != dev:
+                    x = x.to(dev, non_blocking=True)
+                with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                    enabled=use_amp):
+                    recon, mu, log_var = model(x)
+                loss, rec, kl = cvae_loss(recon.float(), x.float(),
+                                          mu.float(), log_var.float(), beta=beta)
+                va_total += loss.detach()
+                va_recon += rec.detach()
+                va_kl    += kl.detach()
+        Nv = len(dl_val)
+        va_total_v = (va_total / Nv).item()
+        va_recon_v = (va_recon / Nv).item()
+        va_kl_v    = (va_kl    / Nv).item()
 
-        sched.step(va_total)
+        sched.step(va_total_v)
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{n_epochs}  "
-                  f"train={tr_total:.5f} (rec={tr_recon:.5f} kl={tr_kl:.5f})  "
-                  f"val={va_total:.5f} (rec={va_recon:.5f} kl={va_kl:.5f})  "
-                  f"lr={optim.param_groups[0]['lr']:.2e}")
+                  f"train={tr_total_v:.5f} (rec={tr_recon_v:.5f} kl={tr_kl_v:.5f})  "
+                  f"val={va_total_v:.5f} (rec={va_recon_v:.5f} kl={va_kl_v:.5f})  "
+                  f"lr={optim.param_groups[0]['lr']:.2e}", flush=True)
 
         # ── Early stopping / checkpoint ───────────────────────────────────────
-        if va_total < best_val - 1e-7:
-            best_val  = va_total
+        if va_total_v < best_val - 1e-7:
+            best_val  = va_total_v
             no_improv = 0
             Path(ckpt_out).parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -521,7 +577,7 @@ def train_beta_vae(
     seed:            int   = SEED,
     device:          str   = "cuda",
     use_amp:         bool  = False,
-    use_amp:         bool  = False,
+    regime_ablation: bool  = False,
 ) -> None:
     """Train BetaVAE_Raman with β annealing and save checkpoint + scaler."""
     torch.manual_seed(seed)
@@ -529,9 +585,14 @@ def train_beta_vae(
     random.seed(seed)
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    # AMP: auto-enable on CUDA unless caller explicitly disables via use_amp=False
     amp_enabled = use_amp and dev.type == "cuda"
+    # Default: always use AMP on CUDA (consistent with CDAE/CVAE)
+    if not use_amp and dev.type == "cuda":
+        amp_enabled = True
     print(f"\n{'='*60}")
-    print(f"  Training β-VAE  |  latent={latent_dim}  max_β={max_beta}  AMP={amp_enabled}")
+    print(f"  Training β-VAE  |  latent={latent_dim}  max_β={max_beta}  AMP={amp_enabled}"
+          f"{'  [R1 only]' if regime_ablation else ''}")
     print(f"  schedule={anneal_schedule}  anneal_epochs={anneal_epochs}  "
           f"delay={anneal_delay}  n_cycles={n_cycles}  device={dev}")
     print(f"{'='*60}")
@@ -552,9 +613,10 @@ def train_beta_vae(
         )
     print(f"  β schedule: {schedule}")
 
-    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed)
+    X_train_raw, X_val_raw = load_raman_splits(csv_path, seed=seed,
+                                               regime_ablation=regime_ablation)
     X_train, X_val, scaler = preprocess(X_train_raw, X_val_raw)
-    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size)
+    dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size, dev)
 
     model = BetaVAE_Raman(
         input_length=N_RAMAN_COLS,
@@ -564,7 +626,7 @@ def train_beta_vae(
     optim   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(
                   optim, mode="min", factor=LR_FACTOR,
-                  patience=LR_PATIENCE, verbose=True)
+                  patience=LR_PATIENCE, verbose=False)
     grad_scaler = GradScaler("cuda", enabled=amp_enabled)
 
     best_val        = float("inf")
@@ -574,68 +636,71 @@ def train_beta_vae(
     for epoch in range(1, n_epochs + 1):
         beta = schedule.get_beta(epoch)
 
-        # Detect the first epoch where β reaches its maximum value.
-        # At this point we reset the early-stopping tracker so that the
-        # delay / ramp phases don't count against training time.
         if not beta_fully_on and beta >= max_beta - 1e-6:
             beta_fully_on = True
             best_val      = float("inf")
             no_improv     = 0
             print(f"  Epoch {epoch}: β reached max ({beta:.4f}) — "
-                  f"early stopping and checkpoint tracking now active")
+                  f"early stopping and checkpoint tracking now active", flush=True)
 
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
-        tr_total = tr_recon = tr_kl = 0.0
+        tr_total = torch.zeros(1, device=dev)
+        tr_recon = torch.zeros(1, device=dev)
+        tr_kl    = torch.zeros(1, device=dev)
         for (x,) in dl_train:
-            x = x.to(dev)
-            optim.zero_grad()
+            if x.device != dev:
+                x = x.to(dev, non_blocking=True)
+            optim.zero_grad(set_to_none=True)
             with autocast("cuda", enabled=amp_enabled):
-                recon, mu, log_var = model(x)    # reparameterised in train mode
+                recon, mu, log_var = model(x)
                 loss, rec, kl = beta_vae_loss(recon, x, mu, log_var, beta=beta)
+            grad_scaler.scale(loss).backward()
             grad_scaler.unscale_(optim)
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             grad_scaler.step(optim)
             grad_scaler.update()
-            n = len(x)
-            tr_total += loss.item() * n
-            tr_recon += rec.item()  * n
-            tr_kl    += kl.item()   * n
-        N = len(dl_train.dataset)
-        tr_total /= N;  tr_recon /= N;  tr_kl /= N
+            tr_total += loss.detach()
+            tr_recon += rec.detach()
+            tr_kl    += kl.detach()
+        N = len(dl_train)
+        tr_total_v = (tr_total / N).item()
+        tr_recon_v = (tr_recon / N).item()
+        tr_kl_v    = (tr_kl    / N).item()
 
         # ── Validate (use mu only, no sampling) ───────────────────────────────
         model.eval()
-        va_total = va_recon = va_kl = 0.0
+        va_total = torch.zeros(1, device=dev)
+        va_recon = torch.zeros(1, device=dev)
+        va_kl    = torch.zeros(1, device=dev)
         with torch.no_grad():
             for (x,) in dl_val:
-                x = x.to(dev)
+                if x.device != dev:
+                    x = x.to(dev, non_blocking=True)
                 with autocast("cuda", enabled=amp_enabled):
-                    recon, mu, log_var = model(x)   # eval: uses mu (no sampling)
-                loss, rec, kl = beta_vae_loss(recon, x, mu, log_var, beta=beta)
-
-                n = len(x)
-                va_total += loss.item() * n
-                va_recon += rec.item()  * n
-                va_kl    += kl.item()   * n
-        Nv = len(dl_val.dataset)
-        va_total /= Nv;  va_recon /= Nv;  va_kl /= Nv
+                    recon, mu, log_var = model(x)
+                loss, rec, kl = beta_vae_loss(recon.float(), x.float(),
+                                              mu.float(), log_var.float(), beta=beta)
+                va_total += loss.detach()
+                va_recon += rec.detach()
+                va_kl    += kl.detach()
+        Nv = len(dl_val)
+        va_total_v = (va_total / Nv).item()
+        va_recon_v = (va_recon / Nv).item()
+        va_kl_v    = (va_kl    / Nv).item()
 
         # ReduceLROnPlateau tracks reconstruction loss to avoid β noise
-        sched.step(va_recon)
+        sched.step(va_recon_v)
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{n_epochs}  β={beta:.4f}  "
-                  f"train={tr_total:.5f} (rec={tr_recon:.5f} kl={tr_kl:.5f})  "
-                  f"val={va_total:.5f} (rec={va_recon:.5f} kl={va_kl:.5f})  "
-                  f"lr={optim.param_groups[0]['lr']:.2e}")
+                  f"train={tr_total_v:.5f} (rec={tr_recon_v:.5f} kl={tr_kl_v:.5f})  "
+                  f"val={va_total_v:.5f} (rec={va_recon_v:.5f} kl={va_kl_v:.5f})  "
+                  f"lr={optim.param_groups[0]['lr']:.2e}", flush=True)
 
         # ── Early stopping / checkpoint ───────────────────────────────────────
-        # Only track and checkpoint once β has fully ramped up (beta_fully_on).
-        # Before that, the reconstruction is either unregularised (β=0) or in
-        # a transient ramp — we don't want those weights as the final encoder.
-        if beta_fully_on and va_recon < best_val - 1e-7:
-            best_val  = va_recon
+        if beta_fully_on and va_recon_v < best_val - 1e-7:
+            best_val  = va_recon_v
             no_improv = 0
             Path(ckpt_out).parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -713,6 +778,8 @@ def main() -> None:
                         help="Override output checkpoint path")
     parser.add_argument("--scaler",      default=None,
                         help="Override output scaler path")
+    parser.add_argument("--regime-ablation", action="store_true",
+                        help="Train on R1 only (batches 0-29), mirroring Protocol 2")
     args = parser.parse_args()
 
     if args.model == "cdae":
@@ -730,6 +797,7 @@ def main() -> None:
             weight_decay= args.weight_decay,
             seed        = args.seed,
             device      = args.device,
+            regime_ablation = args.regime_ablation,
         )
     elif args.model == "cvae":
         ckpt_out   = args.ckpt   or "./checkpoints/cvae_best.pt"
@@ -746,6 +814,7 @@ def main() -> None:
             weight_decay= args.weight_decay,
             seed        = args.seed,
             device      = args.device,
+            regime_ablation = args.regime_ablation,
         )
     else:  # beta_vae
         ckpt_out   = args.ckpt   or "./checkpoints/beta_vae_best.pt"
@@ -767,6 +836,7 @@ def main() -> None:
             seed            = args.seed,
             device          = args.device,
             use_amp         = args.amp,
+            regime_ablation = args.regime_ablation,
         )
 
 

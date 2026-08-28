@@ -128,7 +128,7 @@ class PILSTMAlgorithm(BaseAlgorithm):
     def _build_dataset(self, batches, scalers: ScalerBundle) -> TensorDataset:
         feat_cols = self._feature_cols()
         seq_len   = int(self.cfg.training.seq_len)
-        X_list, y_list = [], []
+        X_parts, y_parts = [], []
 
         for b in batches:
             feats = scalers.feat.transform(
@@ -141,36 +141,54 @@ class PILSTMAlgorithm(BaseAlgorithm):
                 b[TARGET_COLS[1]].values.reshape(-1, 1)
             ).flatten().astype(np.float32)
             tgts = np.stack([bio_n, pen_n], axis=-1)   # (T, 2)
-            T = len(feats)
-            for i in range(T - seq_len + 1):
-                X_list.append(feats[i : i + seq_len])
-                y_list.append(tgts[i  : i + seq_len])
 
-        X = torch.tensor(np.array(X_list, dtype=np.float32))
-        y = torch.tensor(np.array(y_list, dtype=np.float32))
-        print(f"  Sliding-window dataset: {len(X_list):,} windows  "
+            T = len(feats)
+            if T < seq_len:
+                continue
+
+            # Vectorised sliding windows — no Python loop, O(1) allocations
+            n_feat = feats.shape[1]
+            X_win = np.lib.stride_tricks.sliding_window_view(
+                feats, (seq_len, n_feat)
+            )[:, 0].copy()                              # (N_win, seq_len, n_feat)
+            y_win = np.lib.stride_tricks.sliding_window_view(
+                tgts, (seq_len, 2)
+            )[:, 0].copy()                              # (N_win, seq_len, 2)
+            X_parts.append(X_win)
+            y_parts.append(y_win)
+
+        X = torch.from_numpy(np.concatenate(X_parts, axis=0))
+        y = torch.from_numpy(np.concatenate(y_parts, axis=0))
+        print(f"  Sliding-window dataset: {len(X):,} windows  "
               f"(seq_len={seq_len}, n_feat={X.shape[-1]})")
         return TensorDataset(X, y)
 
     def _train_epoch(self, loader: DataLoader, lambda_physics: float = 0.0) -> Dict[str, float]:
         grad_clip  = float(self.cfg.training.grad_clip)
         lambda_r   = float(self.cfg.training.lambda_r_neg)
-
+        use_amp    = self._use_amp
         ep_total, ep_data, ep_phys = [], [], []
 
         for x_b, y_b in loader:
-            x_b = x_b.to(self.device)
-            y_b = y_b.to(self.device)
+            if x_b.device != self.device:
+                x_b = x_b.to(self.device, non_blocking=True)
+                y_b = y_b.to(self.device, non_blocking=True)
 
             self._optimizer.zero_grad(set_to_none=True)
-            loss, ld = compute_pinn_loss(
-                self.model,
-                x_b,
-                y_b,
-                dt_n=self._dt_n,
-                lambda_physics=lambda_physics,
-                lambda_r_neg=lambda_r,
-            )
+
+            # Wrap the full forward+loss in bfloat16 autocast.
+            # The LSTM GEMMs (dominant cost) run on Tensor Cores in BF16.
+            # BF16 has the same exponent range as FP32 so no overflow risk.
+            with torch.autocast(device_type=self.device.type,
+                                dtype=torch.bfloat16, enabled=use_amp):
+                loss, ld = compute_pinn_loss(
+                    self.model,
+                    x_b,
+                    y_b,
+                    dt_n=self._dt_n,
+                    lambda_physics=lambda_physics,
+                    lambda_r_neg=lambda_r,
+                )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             self._optimizer.step()
@@ -189,14 +207,20 @@ class PILSTMAlgorithm(BaseAlgorithm):
         }
 
     def _val_epoch(self, loader: DataLoader) -> float:
-        val_mses: list = []
+        use_amp    = self._use_amp
+        total_loss = torch.zeros(1, device=self.device)
+        n_batches  = 0
         with torch.no_grad():
             for x_b, y_b in loader:
-                x_b = x_b.to(self.device)
-                y_b = y_b.to(self.device)
-                pred = self.model(x_b)
-                val_mses.append(F.mse_loss(pred, y_b).item())
-        return float(np.mean(val_mses))
+                if x_b.device != self.device:
+                    x_b = x_b.to(self.device, non_blocking=True)
+                    y_b = y_b.to(self.device, non_blocking=True)
+                with torch.autocast(device_type=self.device.type,
+                                    dtype=torch.bfloat16, enabled=use_amp):
+                    pred = self.model(x_b)
+                total_loss += F.mse_loss(pred.float(), y_b.float())
+                n_batches  += 1
+        return (total_loss / max(n_batches, 1)).item()
 
     def evaluate(self, batches) -> Dict[str, Any]:
         """

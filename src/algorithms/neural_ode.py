@@ -151,18 +151,23 @@ class NeuralODEAlgorithm(BaseAlgorithm):
         solver     = str(self.cfg.training.train_solver)
         grad_clip  = float(self.cfg.training.grad_clip)
         t_span     = self._t_span
+        use_amp    = self._use_amp
 
         total_loss = 0.0
         n_samples  = 0
 
         for U_b, y0_b, y_b in loader:
-            U_b  = U_b.to(self.device)
-            y0_b = y0_b.to(self.device)
-            y_b  = y_b.to(self.device)
+            if U_b.device != self.device:
+                U_b  = U_b.to(self.device,  non_blocking=True)
+                y0_b = y0_b.to(self.device, non_blocking=True)
+                y_b  = y_b.to(self.device,  non_blocking=True)
 
             self._optimizer.zero_grad()
-            traj = self.model(y0_b, t_span, U_b, method=solver)
-            loss = F.mse_loss(traj, y_b)
+
+            with torch.autocast(device_type=self.device.type,
+                                dtype=torch.bfloat16, enabled=use_amp):
+                traj = self.model(y0_b, t_span, U_b, method=solver)
+            loss = F.mse_loss(traj.float(), y_b.float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             self._optimizer.step()
@@ -173,22 +178,25 @@ class NeuralODEAlgorithm(BaseAlgorithm):
         return {"train_loss": total_loss / max(n_samples, 1)}
 
     def _val_epoch(self, loader: DataLoader) -> float:
-        solver   = str(self.cfg.training.train_solver)
-        t_span   = self._t_span
-        total    = 0.0
-        n_samp   = 0
+        solver    = str(self.cfg.training.train_solver)
+        t_span    = self._t_span
+        use_amp   = self._use_amp
+        total     = torch.zeros(1, device=self.device)
+        n_batches = 0
 
         with torch.no_grad():
             for U_b, y0_b, y_b in loader:
-                U_b  = U_b.to(self.device)
-                y0_b = y0_b.to(self.device)
-                y_b  = y_b.to(self.device)
+                if U_b.device != self.device:
+                    U_b  = U_b.to(self.device,  non_blocking=True)
+                    y0_b = y0_b.to(self.device, non_blocking=True)
+                    y_b  = y_b.to(self.device,  non_blocking=True)
+                with torch.autocast(device_type=self.device.type,
+                                    dtype=torch.bfloat16, enabled=use_amp):
+                    traj = self.model(y0_b, t_span, U_b, method=solver)
+                total     += F.mse_loss(traj.float(), y_b.float())
+                n_batches += 1
 
-                traj   = self.model(y0_b, t_span, U_b, method=solver)
-                total += F.mse_loss(traj, y_b).item() * len(y0_b)
-                n_samp += len(y0_b)
-
-        return total / max(n_samp, 1)
+        return (total / max(n_batches, 1)).item()
 
     def evaluate(self, batches) -> Dict[str, Any]:
         """
