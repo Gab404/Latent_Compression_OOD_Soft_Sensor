@@ -90,33 +90,34 @@ PHYSICAL_FACTORS: Dict[str, str] = {
     "Temperature (K)":     "Temperature(T:K)",
     "Vessel Vol (L)":      "Vessel Volume(V:L)",
     "Aeration (L/h)":      "Aeration rate(Fg:L/h)",
-    "Agitator (RPM)":      "Agitator RPM(RPM:RPM)",
-    "CO2 offgas (%)":      "carbon dioxide percent in off-gas(CO2outgas:%)",
-    "O2 offgas (%)":       "Oxygen in percent in off-gas(O2:O2  (%))",
     "Batch Time (norm)":   "__TIME_NORM__",   # computed per-batch, not a CSV column
+    "PAA (g/L)":           "PAA concentration offline(PAA_offline:PAA (g L^{-1}))",
+    "NH3 (g/L)":           "NH_3 concentration off-line(NH3_offline:NH3 (g L^{-1}))",
+    "Viscosity (cP)":      "Viscosity(Viscosity_offline:centPoise)",
 }
 
+# Encoder definitions
 # Encoder definitions
 ENCODERS = {
     "CDAE": {
         "class":       "CDAERamanEncoderV2",
         "module":      "src.data.cdae_encoder",
-        "ckpt":        "./checkpoints/cdae_best.pt",
-        "scaler":      "./checkpoints/cdae_scaler.joblib",
+        "ckpt":        "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/encoders/cdae_s42.pt",
+        "scaler":      "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/encoders/cdae_scaler_s42.joblib",
         "latent_dim":  64,
     },
     "CVAE": {
         "class":       "CVAERamanEncoderV2",
         "module":      "src.data.cvae_encoder",
-        "ckpt":        "./checkpoints/cvae_best.pt",
-        "scaler":      "./checkpoints/cvae_scaler.joblib",
+        "ckpt":        "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/encoders/cvae_s42.pt",
+        "scaler":      "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/encoders/cvae_scaler_s42.joblib",
         "latent_dim":  64,
     },
-    "Beta-VAE": {
+    "Beta-VAE": { # Beta-VAE Heavy (Protocole 1)
         "class":       "BetaVAERamanEncoderV2",
         "module":      "src.data.beta_vae_encoder",
-        "ckpt":        "./checkpoints/beta_vae_best.pt",
-        "scaler":      "./checkpoints/beta_vae_scaler.joblib",
+        "ckpt":        "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p1/encoders/beta_vae_s42.pt",
+        "scaler":      "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p1/encoders/beta_vae_scaler_s42.joblib",
         "latent_dim":  64,
     },
 }

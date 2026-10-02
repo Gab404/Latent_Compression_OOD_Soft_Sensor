@@ -466,16 +466,16 @@ def eval_jit_ft(
     if variant == "beta_vae":
         db_path = "checkpoints/beta_vae_jit_ft_db_r1.npz"
         global_ckpt = "checkpoints/beta_vae_pi_lstm_regime_ablation.pt"
-        enc_ckpt = "checkpoints/beta_vae_best.pt"
-        enc_scaler = "checkpoints/beta_vae_scaler.joblib"
+        enc_ckpt_default = "checkpoints/beta_vae_best.pt"
+        enc_scaler_default = "checkpoints/beta_vae_scaler.joblib"
         model_class = BetaVAE_Raman
         K = 150
         label = "β-VAE-LSTM JIT-FT"
     else:  # cvae
         db_path = "checkpoints/cvae_jit_ft_db_r1.npz"
         global_ckpt = "checkpoints/cvae_pi_lstm_regime_ablation.pt"
-        enc_ckpt = "checkpoints/cvae_best.pt"
-        enc_scaler = "checkpoints/cvae_scaler.joblib"
+        enc_ckpt_default = "checkpoints/cvae_best.pt"
+        enc_scaler_default = "checkpoints/cvae_scaler.joblib"
         model_class = CVAE_Raman
         K = 200
         label = "CVAE-LSTM JIT-FT"
@@ -489,6 +489,17 @@ def eval_jit_ft(
     global_algo.model.eval()
     for p in global_algo.model.parameters():
         p.requires_grad_(False)
+
+    # BUGFIX: the Raman encoder used here MUST match the one `global_ckpt`
+    # was actually trained with (its `feat` MinMaxScaler is calibrated to
+    # that encoder's latent range) — derive it from the checkpoint's own
+    # cfg instead of hardcoding a fixed default, to avoid silent
+    # encoder/LSTM mismatches that inflate RMSE by 50-100x.
+    enc_ckpt   = getattr(global_algo.cfg.data, "raman_ckpt", None)   or enc_ckpt_default
+    enc_scaler = getattr(global_algo.cfg.data, "raman_scaler", None) or enc_scaler_default
+    if (enc_ckpt, enc_scaler) != (enc_ckpt_default, enc_scaler_default):
+        print(f"  [{label}] encoder resolved from {global_ckpt}'s cfg: {enc_ckpt}")
+
 
     # Recompute dt_n from R1 train
     t_all = np.concatenate([b["Time (h)"].values for b in r1_train])

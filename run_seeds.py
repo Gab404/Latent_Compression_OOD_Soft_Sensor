@@ -84,8 +84,8 @@ _ROOT = Path(__file__).resolve().parent
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_SEEDS   = [123, 456, 789, 1024]
-DEFAULT_N_SEEDS = 4
+DEFAULT_SEEDS   = [42, 123, 456, 789, 1024]
+DEFAULT_N_SEEDS = 5
 OUT_ROOT        = _ROOT / "outputs" / "seed_sweep"
 CSV_PATH        = str(_ROOT / "100_Batches_IndPenSim_V3.csv")
 
@@ -109,6 +109,8 @@ TRAINPY_MODELS = [
     "cdae_pi_lstm",       # CDAE-LSTM
     "cvae_pi_lstm",       # CVAE-LSTM
     "beta_vae_pi_lstm",   # β-VAE-LSTM (proposed)
+    "beta_vae_light_fixed_pi_lstm",
+    "beta_vae_light_annealed_pi_lstm",
 ]
 
 # Adaptation models requiring pre-trained base checkpoints.
@@ -148,8 +150,8 @@ ENCODER_CONFIG: Dict[str, Dict] = {
         "extra_args": [
             "--max-beta",        "0.005",
             "--anneal-schedule", "linear",
-            "--anneal-epochs",   "100",
-            "--anneal-delay",    "20",
+            "--anneal-epochs",   "1",
+            "--anneal-delay",    "0",
         ],
     },
     "pca_pi_lstm": {
@@ -163,6 +165,28 @@ ENCODER_CONFIG: Dict[str, Dict] = {
         "script":    "scripts/pls_baseline.py",
         "ckpt_ext":  ".joblib",
         "extra_args": [],
+    },
+    "beta_vae_light_fixed_pi_lstm": {
+        "type":      "beta_vae_light",
+        "script":    "scripts/train_autoencoder.py",
+        "ckpt_ext":  ".pt",
+        "extra_args": [
+            "--max-beta",        "0.005",
+            "--anneal-schedule", "linear",
+            "--anneal-epochs",   "1",       # <--- 1 = Beta fixe dès le début
+            "--anneal-delay",    "0",
+        ],
+    },
+    "beta_vae_light_annealed_pi_lstm": {
+        "type":      "beta_vae_light",
+        "script":    "scripts/train_autoencoder.py",
+        "ckpt_ext":  ".pt",
+        "extra_args": [
+            "--max-beta",        "0.005",
+            "--anneal-schedule", "linear",
+            "--anneal-epochs",   "100",     # <--- 100 = Échauffement progressif
+            "--anneal-delay",    "20",
+        ],
     },
     # pi_lstm and neural_ode use no Raman encoder → no entry here
 }
@@ -268,7 +292,7 @@ def _run_encoder_train(
     log = out_dir / model / f"p{protocol}" / f"encoder_s{seed}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
 
-    if enc_type in ("cdae", "cvae", "beta_vae"):
+    if enc_type in ("cdae", "cvae", "beta_vae", "beta_vae_light"):
         cmd = [
             sys.executable, script,
             "--model",  enc_type,
@@ -739,6 +763,24 @@ def _run_cvae_jit_ft(
     db_cache  = str(adapt_dir / f"jitft_db_s{seed}.npz")
     log_path  = adapt_dir / f"jitft_s{seed}.log"
 
+    # BUGFIX: the Raman encoder fed to the JIT-FT retrieval/fine-tune loop
+    # MUST be the exact same encoder that the frozen global LSTM (base_ckpt)
+    # was trained against — its `feat` MinMaxScaler is calibrated to that
+    # encoder's latent range. Without this, cvae_jit_ft.py silently falls
+    # back to a fixed default encoder (checkpoints/{beta_vae,cvae}_best.pt),
+    # which mismatches every seed except (by luck) the default's own, and
+    # inflates test RMSE by 50-100x (e.g. 0.17 -> 10+ g/L).
+    enc_ckpt = enc_scaler = None
+    if base_model in ENCODER_CONFIG:
+        cand_ckpt   = _enc_ckpt_path(out_dir, base_model, protocol, seed)
+        cand_scaler = _enc_scaler_path(out_dir, base_model, protocol, seed)
+        if cand_ckpt.exists() and cand_scaler.exists():
+            enc_ckpt, enc_scaler = cand_ckpt, cand_scaler
+        else:
+            print(f"  [P{protocol},s={seed}] {model}: WARNING — seeded encoder "
+                  f"not found ({cand_ckpt}); falling back to cvae_jit_ft.py's "
+                  f"default encoder (may mismatch this seed's global LSTM)")
+
     cmd = [
         sys.executable, str(_ROOT / "scripts" / "cvae_jit_ft.py"),
         "--model",       script_model,
@@ -748,6 +790,8 @@ def _run_cvae_jit_ft(
         "--seed",        str(seed),
         "--db-cache",    db_cache,
     ]
+    if enc_ckpt is not None:
+        cmd += ["--cvae-ckpt", str(enc_ckpt), "--cvae-scaler", str(enc_scaler)]
     if protocol == 2:
         cmd += ["--regime-ablation"]
 
@@ -1165,7 +1209,18 @@ def main() -> None:
             "to fit your GPU memory budget (e.g. --parallel 3 for 6 GB)."
         ),
     )
+    parser.add_argument(
+        "--max-beta",
+        type=str,
+        default=None,
+        help="Force la valeur max-beta pour le modèle beta_vae_pi_lstm.",
+    )
     args = parser.parse_args()
+
+    # -- Mise à jour dynamique du paramètre beta --
+    if args.max_beta is not None and "beta_vae_pi_lstm" in ENCODER_CONFIG:
+        # L'index 1 correspond à la valeur suivant "--max-beta" dans la liste extra_args
+        ENCODER_CONFIG["beta_vae_pi_lstm"]["extra_args"][1] = args.max_beta
 
     # ── Resolve models ────────────────────────────────────────────────────────
     if args.model is None or args.model == "all":

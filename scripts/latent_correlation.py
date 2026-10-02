@@ -88,24 +88,24 @@ SPARSE_VARS = {"Biomass", "PAA", "NH3", "Viscosity"}
 MODEL_CONFIGS = {
     "CDAE": {
         "cls":        CDAE_Raman,
-        "ckpt":       "./checkpoints/cdae_best.pt",
-        "scaler":     "./checkpoints/cdae_scaler.joblib",
+        "ckpt":       "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/encoders/cdae_s42.pt",
+        "scaler":     "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/encoders/cdae_scaler_s42.joblib",
         "encode_fn":  "direct",        # encode() returns z directly
         "label":      "CDAE",
         "color":      "#e07b39",       # orange accent for title bar
     },
     "CVAE": {
         "cls":        CVAE_Raman,
-        "ckpt":       "./checkpoints/cvae_best.pt",
-        "scaler":     "./checkpoints/cvae_scaler.joblib",
+        "ckpt":       "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/encoders/cvae_s42.pt",
+        "scaler":     "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/encoders/cvae_scaler_s42.joblib",
         "encode_fn":  "vae",           # encode() returns (mu, log_var)
         "label":      "CVAE",
         "color":      "#3a7ebf",
     },
     "BetaVAE": {
         "cls":        BetaVAE_Raman,
-        "ckpt":       "./checkpoints/beta_vae_best.pt",
-        "scaler":     "./checkpoints/beta_vae_scaler.joblib",
+        "ckpt":       "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p2/encoders/beta_vae_s42.pt",
+        "scaler":     "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p2/encoders/beta_vae_scaler_s42.joblib",
         "encode_fn":  "vae",
         "label":      "β-VAE",
         "color":      "#2ca02c",
@@ -548,7 +548,28 @@ def main() -> None:
     parser.add_argument("--device",     default="cuda")
     parser.add_argument("--no-csv",     action="store_true",
                         help="Skip saving per-model CSV files")
+    parser.add_argument("--beta-vae-ckpt", default=None,
+                        help="Override the β-VAE encoder checkpoint "
+                             "(e.g. a per-seed encoder from the benchmark sweep)")
+    parser.add_argument("--beta-vae-scaler", default=None,
+                        help="Override the β-VAE StandardScaler for --beta-vae-ckpt")
+    parser.add_argument("--models", nargs="+", default=None,
+                        choices=list(MODEL_CONFIGS),
+                        help=f"Subset of models to encode (default: all -> {list(MODEL_CONFIGS)})")
     args = parser.parse_args()
+
+    # Apply β-VAE checkpoint overrides before anything is loaded.
+    if args.beta_vae_ckpt:
+        MODEL_CONFIGS["BetaVAE"]["ckpt"] = args.beta_vae_ckpt
+        if args.beta_vae_scaler:
+            MODEL_CONFIGS["BetaVAE"]["scaler"] = args.beta_vae_scaler
+        print(f"\n[override] β-VAE ckpt   : {MODEL_CONFIGS['BetaVAE']['ckpt']}")
+        print(f"[override] β-VAE scaler : {MODEL_CONFIGS['BetaVAE']['scaler']}")
+    elif args.beta_vae_scaler:
+        parser.error("--beta-vae-scaler requires --beta-vae-ckpt")
+
+    selected = args.models or list(MODEL_CONFIGS)
+    active_configs = {k: v for k, v in MODEL_CONFIGS.items() if k in selected}
 
     device     = torch.device(args.device if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
@@ -580,7 +601,7 @@ def main() -> None:
     # ── 3. Encode with each model ─────────────────────────────────────────────
     all_corr: Dict[str, Dict[str, np.ndarray]] = {}
 
-    for key, cfg in MODEL_CONFIGS.items():
+    for key, cfg in active_configs.items():
         print(f"\n{'─'*55}")
         print(f"  Model: {cfg['label']}  |  ckpt: {Path(cfg['ckpt']).name}")
         print(f"{'─'*55}")
@@ -604,7 +625,7 @@ def main() -> None:
     # ── 4. Plot ───────────────────────────────────────────────────────────────
     print(f"\n{'─'*55}")
     print(f"  Plotting heatmaps  (top_n={args.top_n}, min_var_r={args.min_var_r}) ...")
-    plot_heatmaps(all_corr, MODEL_CONFIGS, threshold, output_dir,
+    plot_heatmaps(all_corr, active_configs, threshold, output_dir,
                   top_n=args.top_n, min_var_r=args.min_var_r)
 
     # ── 5. Save CSVs ──────────────────────────────────────────────────────────

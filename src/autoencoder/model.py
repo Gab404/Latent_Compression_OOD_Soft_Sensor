@@ -258,7 +258,13 @@ class CVAE_Raman(nn.Module):
         z = self.enc_block2(z)
         z = self.enc_block3(z)
         z = z.view(z.size(0), -1)
-        return self.fc_mu(z), self.fc_log_var(z)
+
+        mu = self.fc_mu(z)
+        log_var = self.fc_log_var(z)
+
+        log_var = torch.clamp(log_var, min=-10.0, max=10.0)
+        
+        return mu, log_var
 
     @staticmethod
     def reparameterise(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:

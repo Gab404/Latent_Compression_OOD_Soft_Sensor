@@ -1,8 +1,10 @@
 # ReaKt-v2 — Penicillin Soft-Sensor Benchmark
 
-Benchmark comparing multiple model architectures as soft-sensors for online penicillin prediction from Raman spectra on **IndPenSim V3** (100 batches, 2,001 Raman channels).
+Benchmark comparing model architectures as soft-sensors for online penicillin prediction
+from Raman spectra on **IndPenSim V3** (100 batches, 2,001 Raman channels).
 
-The core pipeline is: **frozen beta-VAE encoder** (Raman -> 64-dim latent z) -> **PI-LSTM** (z sequence -> Penicillin g/L).
+Core pipeline: **frozen Raman encoder** (CDAE / CVAE / β-VAE / PCA / PLS → latent z)
+→ **PI-LSTM** (z sequence → Penicillin g/L, physics-informed loss).
 
 ---
 
@@ -13,425 +15,295 @@ python3.10 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Place `100_Batches_IndPenSim_V3.csv` in the project root (not tracked by git -- obtain separately).
+Place `100_Batches_IndPenSim_V3.csv` in the project root (not tracked — download from
+[industrialpenicillinsimulation.com](http://www.industrialpenicillinsimulation.com/)).
+
+Scripts under `scripts/` need the project root on `PYTHONPATH`:
+```bash
+PYTHONPATH=. python scripts/<script>.py
+```
 
 ---
 
 ## Quick Reference
 
-| What you want to do | Command |
+| Goal | Command |
 |---|---|
-| Train one model (default seed) | `python train.py --model beta_vae_pi_lstm` |
-| Train with a specific seed | `python train.py --model beta_vae_pi_lstm --seed 123` |
+| Train one model | `python train.py --model beta_vae_pi_lstm` |
 | Evaluate a checkpoint | `python evaluate.py --model beta_vae_pi_lstm` |
-| Evaluate a specific seed | `python evaluate.py --model beta_vae_pi_lstm --seed 123` |
-| Multi-seed validation (5 seeds) | `python run_seeds.py --model beta_vae_pi_lstm` |
-| Multi-seed validation (10 seeds) | `python run_seeds.py --model beta_vae_pi_lstm --n-seeds 10` |
-| Quick smoke test (3 seeds, 20 ep) | `python run_seeds.py --model pi_lstm --n-seeds 3 --epochs 20` |
-| Beta sweep (encoder + LSTM) | `PYTHONPATH=. python scripts/beta_sweep_e2e.py` |
+| Multi-seed benchmark (5 seeds, both protocols) | `python run_seeds.py --model beta_vae_pi_lstm` |
+| Train a Raman encoder from scratch | `PYTHONPATH=. python scripts/train_autoencoder.py --model beta_vae` |
+| β sweep (encoder + LSTM per β) | `PYTHONPATH=. python scripts/beta_sweep_e2e.py` |
 | Static baselines (PLS, PCA-PCR) | `PYTHONPATH=. python scripts/pls_pca_baseline_k64.py` |
+| JIT fine-tuning adaptation | `PYTHONPATH=. python scripts/cvae_jit_ft.py --model beta_vae` |
+| Local-PLS adaptation (VAE-JITL) | `PYTHONPATH=. python scripts/vae_jitl.py` |
 
 ---
 
-## 1. Single Training Run
+## 1. Single Training Run — `train.py`
 
 ```bash
-# Basic usage — loads configs/beta_vae_pi_lstm.yaml, seed=42
-python train.py --model beta_vae_pi_lstm
-
-# Override seed (checkpoint auto-named to *_s123.pt to avoid collision)
-python train.py --model beta_vae_pi_lstm --seed 123
-
-# Override epochs, device, checkpoint path
-python train.py --model cdae_pi_lstm --epochs 50 --device cpu --ckpt /tmp/test.pt
-
-# Regime ablation (train R1, test R2)
-python train.py --model beta_vae_pi_lstm --regime-ablation
-
-# Disable early stopping (train full epochs)
-python train.py --model beta_vae_pi_lstm --no-early-stopping
+python train.py --model beta_vae_pi_lstm                      # seed=42, configs/<model>.yaml
+python train.py --model beta_vae_pi_lstm --seed 123            # checkpoint auto-renamed *_s123.pt
+python train.py --model cdae_pi_lstm --epochs 50 --device cpu
+python train.py --model beta_vae_pi_lstm --regime-ablation     # train R1, test R2
 ```
-
-### train.py options
 
 | Flag | Description |
 |---|---|
-| `--model NAME` | Algorithm name (required, see Models below) |
-| `--seed N` | Override random seed; auto-renames checkpoint to `*_s{N}.pt` |
-| `--epochs N` | Override training epochs from config |
-| `--ckpt PATH` | Override checkpoint save path |
-| `--config PATH` | Override YAML config file |
-| `--device cpu/cuda` | Force device (default: auto-detect) |
-| `--regime-ablation` | Train on R1 (batches 1-30), test on R2 (31-60) |
-| `--no-early-stopping` | Disable early stopping, run all epochs |
-| `--no-plots` | Skip saving prediction plots |
+| `--model NAME` | Required. See [Models](#models) for the full list. |
+| `--seed N` | Overrides seed; renames checkpoint to `*_s{N}.pt`. |
+| `--epochs N` | Overrides `n_epochs` from the YAML config. |
+| `--ckpt PATH` / `--config PATH` | Override output checkpoint / input config. |
+| `--device cpu/cuda` | Force device (default: auto-detect). |
+| `--regime-ablation` | Train on R1 (batches 1–30), test on R2 (31–60). |
+| `--no-early-stopping` | Run all epochs, ignore early-stopping patience. |
+| `--no-plots` | Skip saving prediction/history plots. |
+| `--raman-ckpt` / `--raman-scaler` | Point to a specific (e.g. per-seed) frozen encoder instead of the config default. |
 
-### What happens under the hood
-
-1. Load YAML config from `configs/<model>.yaml`
-2. Set seed (`random`, `numpy`, `torch`)
-3. Load CSV, detect batches, split into train/val/test
-4. Build Raman encoder (if needed), encode spectra -> latents
-5. Build sliding-window dataset (per-batch, no cross-batch windows)
-6. Train with early stopping, LR scheduling, physics loss annealing
-7. Evaluate on val + test, save checkpoint with metrics embedded
-8. Save prediction plots
+What it does: loads `configs/<model>.yaml` → sets seeds → loads CSV & splits batches →
+encodes Raman spectra (if applicable) → builds per-batch sliding windows → trains with
+early stopping + annealed physics loss → evaluates on val/test → saves checkpoint
+(weights + embedded config + metrics) and plots.
 
 ---
 
-## 2. Single Evaluation
+## 2. Single Evaluation — `evaluate.py`
 
 ```bash
-# Evaluate default checkpoint
-python evaluate.py --model beta_vae_pi_lstm
-
-# Evaluate a specific seed's checkpoint
-python evaluate.py --model beta_vae_pi_lstm --seed 123
-
-# Evaluate a custom checkpoint
-python evaluate.py --model beta_vae_pi_lstm --ckpt path/to/model.pt
-
-# Evaluate ALL models with checkpoints on disk
-python evaluate.py --model all
-
-# With prediction plots
-python evaluate.py --model all --plots
+python evaluate.py --model beta_vae_pi_lstm                    # default checkpoint
+python evaluate.py --model beta_vae_pi_lstm --seed 123          # resolves *_s123.pt
+python evaluate.py --model all --plots                          # every checkpoint on disk
 ```
-
-### evaluate.py options
 
 | Flag | Description |
 |---|---|
-| `--model NAME/all` | Model to evaluate (default: `all`) |
-| `--seed N` | Override seed; auto-resolves `*_s{N}.pt` checkpoint |
-| `--ckpt PATH` | Custom checkpoint path |
-| `--plots` | Save per-batch prediction grids |
-| `--scatter PATH` | Save scatter comparison plot |
-| `--regime-ablation` | Use regime-ablation splits |
-| `--test-regime 2/3` | Which regime to test on (with `--regime-ablation`) |
+| `--model NAME/all` | Model to evaluate (default: `all`). |
+| `--seed N` | Resolves `*_s{N}.pt`. |
+| `--ckpt PATH` | Custom checkpoint path. |
+| `--plots` / `--scatter PATH` | Save prediction grids / scatter comparison. |
+| `--regime-ablation --test-regime 2/3` | Evaluate on R2 or R3 instead of the fault set. |
 
 ---
 
-## 3. Multi-Seed Validation (Recommended for Papers)
+## 3. Multi-Seed Benchmark — `run_seeds.py`
 
-Use `run_seeds.py` to train and evaluate across multiple seeds in one command. Results are aggregated into a CSV with mean +/- std.
+Trains and evaluates across multiple seeds, both protocols, and aggregates mean ± std.
 
 ```bash
-# Default: 5 seeds (42, 123, 456, 789, 1024)
-python run_seeds.py --model beta_vae_pi_lstm
-
-# 10 seeds
-python run_seeds.py --model beta_vae_pi_lstm --n-seeds 10
-
-# Custom seeds
-python run_seeds.py --model beta_vae_pi_lstm --seeds 0 1 2 3 4 5 6 7 8 9
-
-# Quick smoke test
-python run_seeds.py --model pi_lstm --n-seeds 3 --epochs 20 --device cpu
-
-# Resume interrupted sweep (skip seeds with existing checkpoints)
-python run_seeds.py --model beta_vae_pi_lstm --skip-existing
-
-# Evaluate only (no training, just aggregate existing results)
-python run_seeds.py --model beta_vae_pi_lstm --eval-only
-
-# With regime ablation
-python run_seeds.py --model beta_vae_pi_lstm --n-seeds 5 --regime-ablation
+python run_seeds.py --model beta_vae_pi_lstm                              # 5 default seeds, both protocols
+python run_seeds.py --model beta_vae_pi_lstm --seeds 42 123 456           # custom seeds
+python run_seeds.py --model beta_vae_pi_lstm --protocol 1                 # one protocol only
+python run_seeds.py --model all --device cuda                             # every model, sequential
+python run_seeds.py --model beta_vae_pi_lstm --eval-only                  # re-aggregate only
+python run_seeds.py --model beta_vae_pi_lstm --skip-existing --parallel 1 # resume, avoid GPU/RAM OOM
 ```
-
-### Output structure
-
-```
-outputs/seed_sweep/<model>/
-    results.csv                    # Per-seed metrics + mean/std summary
-    checkpoints/
-        <model>_s42.pt             # Checkpoint per seed
-        <model>_s123.pt
-        ...
-    seed_42.log                    # Training log per seed
-    seed_123.log
-    ...
-```
-
-### results.csv format
-
-```csv
-seed,val_pen_rmse,val_pen_mae,val_pen_r2,test_pen_rmse,test_pen_mae,test_pen_r2
-42,0.1523,0.1102,0.9987,0.3340,0.2397,0.9985
-123,0.1489,0.1078,0.9988,0.3412,0.2455,0.9984
-...
-mean,0.1506,0.1090,0.9988,0.3376,0.2426,0.9985
-std,0.0024,0.0017,0.0001,0.0051,0.0041,0.0001
-```
-
-### run_seeds.py options
 
 | Flag | Description |
 |---|---|
-| `--model NAME` | Algorithm name (required) |
-| `--seeds N [N ...]` | Explicit seed list |
-| `--n-seeds N` | Number of seeds if `--seeds` not given (default: 5) |
-| `--epochs N` | Override training epochs |
-| `--device cpu/cuda` | Force device |
-| `--regime-ablation` | Use regime-ablation splits |
-| `--skip-existing` | Skip seeds with existing checkpoints |
-| `--eval-only` | Only aggregate, no training |
-| `--out-dir PATH` | Custom output directory |
+| `--model NAME/all` | Single model or every registered model + adaptation variant. |
+| `--protocol 1/2/both` | 1 = train R1–R3, test R4 (fault). 2 = train R1 only, test R4 (also reports R2/R3). |
+| `--seeds N [N ...]` / `--n-seeds N` | Explicit list, or count of default seeds (42, 123, 456, 789, 1024). |
+| `--epochs N` / `--device` | Override epochs / force device. |
+| `--skip-existing` | Resume: skip seeds with existing checkpoints. |
+| `--eval-only` | No training, just aggregate existing checkpoints/caches. |
+| `--parallel N` | Concurrent GPU jobs (default 4). **Lower this (1–2) for adaptation models** (`*_jit_ft`, `vae_jitl`) — each JIT-FT job loads a full encoder + LSTM + K-NN window DB and 4+ in parallel can OOM a small GPU/host. |
+| `--out-dir PATH` | Custom output root (default `outputs/seed_sweep/<model>`). |
+
+Adaptation models (`beta_vae_jit_ft`, `cvae_jit_ft`, `vae_jitl`) are trained in Phase 1/2
+(their base LSTM + encoder), then Phase 3 runs the on-the-fly adaptation script per seed —
+no extra flags needed, just pass the model name like any other.
+
+**Output**: `outputs/seed_sweep/<model>/`
+```
+summary.csv                      # mean ± std / NRMSE% / Δ% per protocol
+p{1,2}/checkpoints/<model>_s{seed}.pt
+p{1,2}/encoders/{type}_s{seed}.pt + {type}_scaler_s{seed}.joblib   # per-seed Raman encoder, if applicable
+p{1,2}/seed_{seed}.log
+```
 
 ---
 
-## 4. Full Benchmark Pipeline
+## 4. Raman Encoders — `scripts/train_autoencoder.py`
+
+Trains a CDAE / CVAE / β-VAE encoder from scratch (independent of any LSTM).
 
 ```bash
-# Step 1: Train beta-VAE encoder
-PYTHONPATH=. python scripts/train_autoencoder.py --model beta_vae
-
-# Step 2: Full beta sweep (encoder + PI-LSTM per beta)
-PYTHONPATH=. python scripts/beta_sweep_e2e.py
-
-# Step 3: Static baselines
-PYTHONPATH=. python scripts/pls_pca_baseline_k64.py
-
-# Step 4: Alternative temporal models
-PYTHONPATH=. python scripts/train_latent_ode.py
-PYTHONPATH=. python scripts/train_neural_cde.py
-PYTHONPATH=. python scripts/train_sindyc.py
-
-# Step 5: Multi-seed validation of best model
-python run_seeds.py --model beta_vae_pi_lstm --n-seeds 10
-
-# Step 6: Aggregate comparison table
-PYTHONPATH=. python scripts/benchmark_summary.py
+PYTHONPATH=. python scripts/train_autoencoder.py --model beta_vae \
+    --max-beta 0.005 --anneal-schedule linear --anneal-epochs 100 --anneal-delay 20
+PYTHONPATH=. python scripts/train_autoencoder.py --model cvae --beta 1.0
+PYTHONPATH=. python scripts/train_autoencoder.py --model cdae --noise-std 0.1
 ```
 
-For long-running scripts, use background execution:
+Key flags: `--model {cdae,cvae,beta_vae,beta_vae_light}`, `--latent-dim` (default 64),
+`--max-beta` / `--anneal-schedule {linear,cyclical}` / `--anneal-epochs` / `--anneal-delay`
+(β-VAE only), `--regime-ablation` (train on R1 only), `--seed`, `--ckpt` / `--scaler`.
+
+Static baselines (PCA / PLS) use dedicated scripts with a similar CLI:
+`scripts/pca_baseline.py`, `scripts/pls_baseline.py`, `scripts/pls_pca_baseline_k64.py`
+(the 64-component joint sweep used for the benchmark table), `scripts/svr_baseline.py`.
+
+---
+
+## 5. β Sweep — `scripts/beta_sweep_e2e.py`
+
+End-to-end sweep: trains a β-VAE encoder **and** its PI-LSTM for each β value, evaluates
+on R1val/R2/R3/Fault, and reports the U-curve (reconstruction vs. disentanglement trade-off).
+
+```bash
+PYTHONPATH=. python scripts/beta_sweep_e2e.py                                   # default 8-point log grid
+PYTHONPATH=. python scripts/beta_sweep_e2e.py --betas 0.001 0.005 0.05 1.0
+PYTHONPATH=. python scripts/beta_sweep_e2e.py --skip-trained --out-dir outputs/my_sweep
+PYTHONPATH=. python scripts/beta_sweep_e2e.py --plots-only                      # reuse existing sweep_results.json
+```
+
+`--skip-trained` resumes a sweep by reusing checkpoints already on disk per β
+(`checkpoints/<tag>/{vae.pt,vae_scaler.joblib,lstm.pt}`) — only evaluation is re-run, so
+metrics always reflect the current code. For long sweeps, launch detached:
 ```bash
 nohup .venv/bin/python -u scripts/beta_sweep_e2e.py > outputs/sweep.log 2>&1 &
 ```
 
 ---
 
-## Layout
+## 6. On-the-Fly Adaptation (JIT-FT / VAE-JITL)
 
+Two local-adaptation variants on top of a **frozen** global PI-LSTM:
+
+- **JIT-FT** (`scripts/cvae_jit_ft.py`): retrieves the K nearest training windows by
+  symmetric-KL distance in latent space, briefly fine-tunes a cloned copy of the global
+  LSTM on them, predicts, then discards the clone.
+- **VAE-JITL** (`scripts/vae_jitl.py`): same K-NN retrieval but fits a fresh **local PLS**
+  regression per query instead of fine-tuning a neural net — more robust, slightly higher
+  bias.
+
+```bash
+PYTHONPATH=. python scripts/cvae_jit_ft.py --model beta_vae --K 150 \
+    --global-ckpt outputs/seed_sweep/beta_vae_pi_lstm/p1/checkpoints/beta_vae_pi_lstm_s42.pt \
+    --cvae-ckpt   outputs/seed_sweep/beta_vae_pi_lstm/p1/encoders/beta_vae_s42.pt \
+    --cvae-scaler outputs/seed_sweep/beta_vae_pi_lstm/p1/encoders/beta_vae_scaler_s42.joblib
+
+PYTHONPATH=. python scripts/vae_jitl.py --K 500 --local-model pls --n-components 10
 ```
-ReaKt-v2/
-    train.py                        # Train any model (YAML config + CLI overrides)
-    evaluate.py                     # Evaluate checkpoints
-    run_seeds.py                    # Multi-seed sweep with CSV aggregation
 
-    configs/                        # YAML config per model (21 files)
-        beta_vae_pi_lstm.yaml       # beta-VAE + PI-LSTM (main model)
-        cdae_pi_lstm.yaml           # CDAE + PI-LSTM
-        cvae_pi_lstm.yaml           # CVAE + PI-LSTM
-        pi_lstm.yaml                # Process-only PI-LSTM
-        ...
+> **Important**: `--cvae-ckpt`/`--cvae-scaler` (or `--ckpt`/`--scaler` for `vae_jitl.py`)
+> **must** match the exact encoder the `--global-ckpt` LSTM was trained with — its `feat`
+> scaler is calibrated to that encoder's latent range. `run_seeds.py` resolves this
+> automatically per seed; when calling the scripts directly, always pass matching paths.
 
-    scripts/
-        train_autoencoder.py        # Train CDAE / CVAE / beta-VAE encoder
-        beta_sweep_e2e.py           # End-to-end beta sweep (encoder + PI-LSTM)
-        pls_pca_baseline_k64.py     # PLS and PCA-PCR static baselines
-        train_bvae_mlp.py           # beta-VAE + MLP head
-        train_latent_ode.py         # Latent ODE baseline
-        train_neural_cde.py         # Neural CDE baseline
-        train_sindyc.py             # SINDYc baseline
-        benchmark_summary.py        # Aggregate all results
-        baseline_temporal_poly.py   # Time-only polynomial baseline
-        ...                         # Analysis scripts (SHAP, UMAP, etc.)
+Other useful flags (`cvae_jit_ft.py`): `--local-epochs` / `--local-lr` (fine-tune budget,
+default 8 steps @ 2e-5), `--confidence-threshold` (skip fine-tuning when the K-NN distance
+is low, 0 = always fine-tune), `--regime-ablation` (R1-only DB, evaluates R2/R3/Fault),
+`--rebuild-db` (invalidate a stale `.npz` window cache).
 
-    src/
-        config.py                   # YAML -> Config object
-        autoencoder/                # CDAE_Raman, CVAE_Raman, BetaVAE_Raman
-        data/                       # Dataset, encoders (CDAE/CVAE/PCA/PLS/beta-VAE)
-        models/                     # PyTorch nn.Module definitions
-        algorithms/                 # fit / evaluate / save / load per model
-        physics/                    # Mass-balance loss terms
-        evaluation/                 # compute_metrics (RMSE, MAE, R2)
-        visualization/              # Training history + prediction plots
+---
 
-    checkpoints/                    # Saved weights (not tracked by git)
-    outputs/                        # Results and plots
-        seed_sweep/                 # Multi-seed results
-        beta_sweep_e2e/             # Beta sweep results
-        benchmark/                  # Final comparison table
+## 7. Protocol 2 Standalone Eval — `scripts/protocol2_eval.py`
+
+No CLI flags — runs a fixed battery of static baselines + JIT-FT variants on the R1-only
+(Protocol 2) split and prints a comparison table. Edit the script's constants to change
+checkpoints/encoders.
+
+```bash
+PYTHONPATH=. python scripts/protocol2_eval.py
 ```
 
 ---
 
 ## Models
 
-| Model | Config | Input | Type |
+| Model | Config | Input | Notes |
 |---|---|---|---|
-| `beta_vae_pi_lstm` | `beta_vae_pi_lstm.yaml` | 64-dim mu from frozen beta-VAE | Temporal (PI-LSTM) |
-| `cdae_pi_lstm` | `cdae_pi_lstm.yaml` | 64-dim z from frozen CDAE | Temporal (PI-LSTM) |
-| `cvae_pi_lstm` | `cvae_pi_lstm.yaml` | 64-dim mu from frozen CVAE | Temporal (PI-LSTM) |
-| `pi_lstm` | `pi_lstm.yaml` | 23 process features | Temporal (PI-LSTM) |
-| `pca_pi_lstm` | `pca_pi_lstm.yaml` | 4-dim PCA Raman latents | Temporal (PI-LSTM) |
-| `pls_pi_lstm` | `pls_pi_lstm.yaml` | 4-dim PLS Raman latents | Temporal (PI-LSTM) |
-| `neural_ode` | `neural_ode.yaml` | 23 process features | Continuous-time ODE |
-| `beta_vae_lstm` | `beta_vae_lstm.yaml` | 64-dim mu from frozen beta-VAE | Temporal (vanilla LSTM) |
-| `process_pi_lstm` | `process_pi_lstm.yaml` | 23 process features | Temporal (pen-only head) |
+| `beta_vae_pi_lstm` | `beta_vae_pi_lstm.yaml` | 64-dim μ, frozen β-VAE | Main model |
+| `cvae_pi_lstm` | `cvae_pi_lstm.yaml` | 64-dim μ, frozen CVAE | |
+| `cdae_pi_lstm` | `cdae_pi_lstm.yaml` | 64-dim z, frozen CDAE | |
+| `pca_pi_lstm` / `pls_pi_lstm` | `pca_pi_lstm.yaml` / `pls_pi_lstm.yaml` | 4-dim linear Raman latents | Static baselines |
+| `pi_lstm` / `process_pi_lstm` | `pi_lstm.yaml` | 23 raw process features | No Raman encoder |
+| `neural_ode` | `neural_ode.yaml` | 23 process features | Continuous-time |
+| `beta_vae_lstm` | `beta_vae_lstm.yaml` | 64-dim μ | Vanilla LSTM (no physics loss) |
+| `beta_vae_liquid`, `beta_vae_mamba`, `beta_vae_lp_pi_lstm`, `beta_vae_latent_lp_pi_lstm`, `delta_cdae_pi_lstm`, `cdae_process_pi_lstm` | matching `.yaml` | various | Architecture ablations |
+| `beta_vae_jit_ft`, `cvae_jit_ft`, `vae_jitl` | — (run via `scripts/`) | same latents | On-the-fly adaptation, see §6 |
 
-**Architecture**: 2-layer LSTM(64) -> LayerNorm -> Linear(64->32)+LeakyReLU -> Linear(32->1)+Sigmoid.
-Physics loss: dP = k_prod * r_net * dt, annealed lambda: 0 -> 0.1 over epochs 30-110.
-
----
-
-## Evaluation Protocol
-
-- **Train**: Fault-free batches (1-90), 80/20 random split for train/val
-- **Test**: Faulty batches (91-100), fixed OOD test set
-- **Metrics**: RMSE, MAE, R2 computed at **sparse offline measurement points** only (~20 per batch, ~200 total), in **g/L** units
-- **Regime ablation**: Train on R1 (batches 1-30), test on R2 (31-60) or R3 (61-90)
-
----
-
-## Key Results (Single Seed, seed=42)
-
-| Model | P1 Test RMSE | P2 Test RMSE |
-|---|---|---|
-| β-VAE-LSTM (β=0.005) | 0.132 | 0.289 |
-| CVAE-LSTM | 0.135 | 0.672 |
-| CDAE-LSTM | 0.336 | 0.741 |
-| PLS-LSTM | 0.520 | 0.634 |
-| PCA-PCR (static) | 0.456 | 0.474 |
-| PLS (static) | 0.335 | 0.318 |
-| LSTM (raw features) | 1.629 | 1.985 |
-
-Full results: `outputs/protocol2_results.json`, `outputs/benchmark/comparison_table.csv`
-
----
-
-## 5. Multi-Seed Reproducibility (Mean ± Std)
-
-The paper reports **mean ± std over 5 seeds** (42, 1, 2, 3, 4). Two evaluation protocols:
-- **Protocol 1**: Train on R1–R3 (batches 0–89, 72 train / 18 val), test on R4 (fault, 90–99)
-- **Protocol 2**: Train on R1 only (batches 0–29, 24 train / 6 val), test on R4
-
-### 5.1 LSTM-based models (via `run_seeds.py`)
-
-These models use a **frozen pre-trained encoder** and only retrain the PI-LSTM per seed:
-
-```bash
-# Protocol 1 (default: train R1-R3, test R4 = fault)
-python run_seeds.py --model beta_vae_pi_lstm --seeds 42 1 2 3 4 --device cuda:0
-python run_seeds.py --model cvae_pi_lstm     --seeds 42 1 2 3 4 --device cuda:0
-python run_seeds.py --model cdae_pi_lstm     --seeds 42 1 2 3 4 --device cuda:0
-python run_seeds.py --model pls_pi_lstm      --seeds 42 1 2 3 4 --device cuda:0
-python run_seeds.py --model pca_pi_lstm      --seeds 42 1 2 3 4 --device cuda:0
-python run_seeds.py --model pi_lstm          --seeds 42 1 2 3 4 --device cuda:0
-python run_seeds.py --model neural_ode       --seeds 42 1 2 3 4 --device cuda:0
-
-# Protocol 2 (regime ablation: train R1 only, test R4)
-python run_seeds.py --model beta_vae_pi_lstm --seeds 42 1 2 3 4 --regime-ablation --device cuda:0
-python run_seeds.py --model cvae_pi_lstm     --seeds 42 1 2 3 4 --regime-ablation --device cuda:0
-python run_seeds.py --model cdae_pi_lstm     --seeds 42 1 2 3 4 --regime-ablation --device cuda:0
-python run_seeds.py --model pls_pi_lstm      --seeds 42 1 2 3 4 --regime-ablation --device cuda:0
-python run_seeds.py --model pi_lstm          --seeds 42 1 2 3 4 --regime-ablation --device cuda:0
-python run_seeds.py --model neural_ode       --seeds 42 1 2 3 4 --regime-ablation --device cuda:0
-```
-
-Results per model in `outputs/seed_sweep/<model>/results.csv`.
-
-> **Note**: `run_seeds.py` reuses the frozen encoder checkpoint (e.g., `checkpoints/beta_vae_best.pt`).
-> Only LSTM weights are re-initialized per seed. The data split also changes per seed.
-
-### 5.2 End-to-end retraining (encoder + LSTM per seed)
-
-For the strongest claim, retrain both the β-VAE encoder AND the LSTM from scratch per seed.
-Use `scripts/multi_seed_train.py`:
-
-```bash
-# Protocol 1: retrain β-VAE (300 epochs) + PI-LSTM (200 epochs) × 4 seeds
-PYTHONPATH=. python scripts/multi_seed_train.py --protocol 1 --device cuda:0
-
-# Protocol 2: same but train only on R1
-PYTHONPATH=. python scripts/multi_seed_train.py --protocol 2 --device cuda:0
-
-# Both protocols in one run:
-PYTHONPATH=. python scripts/multi_seed_train.py --protocol both --device cuda:0
-```
-
-Seeds: 1, 2, 3, 4 (seed=42 already has checkpoints from prior runs).
-Outputs: `outputs/multi_seed/protocol{1,2}_results.json`.
-
-**Estimated time**: ~8 min per seed (VAE ~4 min + LSTM ~4 min on V100), ~32 min per protocol.
-
-### 5.3 Static baselines (PCA-PCR, PLS, SVR, time-only)
-
-These train from scratch each time (fast, pure sklearn), so multi-seed is trivial:
-
-```bash
-# All static baselines + both protocols + 5 seeds:
-PYTHONPATH=. python scripts/run_all_seeds.py --models cubic_poly mean_traj pca_pcr pls svr \
-    --seeds 42 1 2 3 4 --protocol both --device cpu
-```
-
-Or use the dedicated script which evaluates them inline:
-```bash
-PYTHONPATH=. python scripts/protocol2_eval.py
-```
-
-### 5.4 JIT-FT and VAE-JITL variants
-
-These require a pre-built window database and a global LSTM checkpoint. Multi-seed
-variability comes from the global model seed (the JIT-FT adaptation is deterministic
-given K neighbors):
-
-```bash
-# β-VAE JIT-FT with regime ablation (uses beta_vae_pi_lstm_regime_ablation.pt)
-PYTHONPATH=. python scripts/cvae_jit_ft.py --model beta_vae --regime-ablation \
-    --device cuda:0 --K 150
-
-# CVAE JIT-FT
-PYTHONPATH=. python scripts/cvae_jit_ft.py --model cvae --regime-ablation \
-    --device cuda:0 --K 200
-
-# VAE-JITL
-PYTHONPATH=. python scripts/vae_jitl.py --regime-ablation --K 500
-```
-
-To run multi-seed JIT-FT, retrain the global model per seed first (step 5.1 or 5.2),
-then rebuild the DB and evaluate:
-```bash
-for SEED in 42 1 2 3 4; do
-  # Point to per-seed global checkpoint
-  PYTHONPATH=. python scripts/cvae_jit_ft.py --model beta_vae --regime-ablation \
-      --global-ckpt outputs/seed_sweep/beta_vae_pi_lstm/checkpoints/beta_vae_pi_lstm_s${SEED}.pt \
-      --db-cache outputs/multi_seed/jit_ft_db_s${SEED}.npz \
-      --rebuild-db --device cuda:0 --K 150
-done
-```
-
-### 5.5 Full automated benchmark (all models, both protocols)
-
-```bash
-# Complete run: all models, seeds 42/1/2/3/4, both protocols
-PYTHONPATH=. python scripts/run_all_seeds.py --protocol both --seeds 42 1 2 3 4 --device cuda:0
-```
-
-This produces `outputs/multi_seed/summary.json` with the final table.
+Architecture: 2-layer LSTM(64) → LayerNorm → Linear(64→32)+LeakyReLU → Linear(32→1)+Sigmoid.
+Physics loss: `dP = k_prod * r_net * dt`, λ annealed 0 → 0.1 over epochs 30–110.
 
 ---
 
 ## Evaluation Protocol
 
-- **Protocol 1 (standard)**: Train on R1–R3 (batches 0–89), 80/20 batch-wise random split → 72 train / 18 val. Test on R4 (fault batches 90–99, 10 batches).
-- **Protocol 2 (regime ablation)**: Train on R1 only (batches 0–29), 80/20 → 24 train / 6 val. Test on R4.
-- **Metrics**: RMSE, MAE, R² computed at **sparse offline measurement points** only (~20 per batch, ~198 test points), in **g/L** units.
-- **NRMSE**: RMSE / max(Penicillin) × 100%, where max = 36.18 g/L.
-- **Δ(%)**: (Test RMSE − Val RMSE) / Val RMSE × 100% — measures generalization gap.
+- **Protocol 1**: Train on R1–R3 (batches 0–89, 80/20 random split → 72 train / 18 val). Test on R4 (fault, 90–99).
+- **Protocol 2 (regime ablation)**: Train on R1 only (batches 0–29 → 24 train / 6 val). Test on R4 (also reports R2/R3 generalization).
+- **Metrics**: RMSE, MAE, R² computed at sparse offline measurement points only (~20/batch, ~200 total), in **g/L**.
+- **NRMSE%**: RMSE / 8.481 g/L (mean sparse-point penicillin concentration) × 100.
+- **Δ%**: (Test RMSE − Val RMSE) / Val RMSE × 100 — generalization gap.
+
+---
+
+## Layout
+
+```
+train.py / evaluate.py / run_seeds.py     Core pipeline entry points (only Python files at repo root)
+
+configs/<model>.yaml                      One YAML per model (data/model/training sections)
+
+scripts/                                  Everything else: training variants, sweeps, adaptation,
+                                           analysis. All run from the repo root:
+                                           `PYTHONPATH=. python scripts/<script>.py`
+    train_autoencoder.py                  Train CDAE / CVAE / β-VAE encoder
+    pca_baseline.py, pls_baseline.py, svr_baseline.py, pls_pca_baseline_k64.py
+    beta_sweep_e2e.py                     End-to-end β sweep (encoder + LSTM)
+    cvae_jit_ft.py, vae_jitl.py            On-the-fly adaptation
+    protocol2_eval.py                      Fixed P2 comparison table
+    multi_seed_train.py, run_all_seeds.py  End-to-end multi-seed retraining (encoder+LSTM)
+    benchmark_summary.py                   Aggregate all results into one table
+    train_latent_ode.py, train_neural_cde.py, train_sindyc.py, train_bvae_mlp.py, train_capacity_vae_lstm.py
+                                            Alternative temporal-model baselines
+    shap_*.py, latent_*.py, evaluate_dci.py, evaluate_mig.py, compute_sap.py, eval_bvae_z52.py,
+    analyze_rotation.py, analyze_latent_norm.py, latent_geometry.py, compute_pr_k95_sweep.py,
+    beta_sweep_viz.py, plot_pr_scaled.py   Interpretability / latent-space analysis (ad hoc, standalone)
+    run_control.sh, run_rotate.sh, run_lstm_seeds.sh, run_fixed_epochs.sh, run_beta_sweep.sh,
+    run_ncde_ablations.sh                  Shell orchestration for the scripts above (multi-seed loops)
+
+src/
+    config.py                              YAML -> Config object
+    latent_norm.py                         Optional latent-scaling intervention (used by train.py)
+    autoencoder/                           CDAE_Raman, CVAE_Raman, BetaVAE_Raman
+    data/                                  Dataset + per-encoder-type loaders
+    models/                                nn.Module definitions
+    algorithms/                            fit / evaluate / save / load per model (REGISTRY)
+    physics/                               Mass-balance physics-loss terms
+    evaluation/                            compute_metrics (RMSE, MAE, R2)
+    visualization/                         Training-history + prediction plots
+
+checkpoints/                               Saved weights (not tracked by git)
+outputs/                                   All generated results, logs, and plots — nothing is
+                                            ever written outside this directory (or checkpoints/)
+    seed_sweep/                            run_seeds.py results
+    seed_sweep_beta/                       run_beta_sweep.sh results (β sweep via run_seeds.py)
+    beta_sweep_e2e/                        beta_sweep_e2e.py results
+    full_rotate_experiments_v2/, _v3/      run_rotate.sh / run_lstm_seeds.sh results
+    latent_norm_experiments/               run_latent_norm.py results
+    benchmark/                             Final comparison table
+```
+
+> **Convention**: every script, regardless of where it lives (`scripts/` or root), is meant to be
+> invoked **from the repository root** so that relative paths (dataset CSV, `outputs/`,
+> `checkpoints/`) resolve correctly — e.g. `PYTHONPATH=. python scripts/latent_geometry.py`,
+> not `cd scripts && python latent_geometry.py`.
 
 ---
 
 ## Reproducibility
 
-- Default seed: 42 (controls train/val split, weight init, data shuffling)
-- Use `run_seeds.py` with 5 seeds to report mean ± std for paper
-- cuDNN non-determinism may cause ±1% run-to-run variation on GPU
-- Checkpoints embed the full config + metrics for traceability
-- Hardware used: DGX Station, 4× Tesla V100-DGXS-16GB (single GPU per experiment)
-- PyTorch 2.5.1+cu124
+- Default seed: 42 (controls train/val split, weight init, data shuffling).
+- Use `run_seeds.py` with ≥5 seeds to report mean ± std.
+- Checkpoints embed the full config + metrics for traceability.
+- cuDNN non-determinism may cause ±1% run-to-run variation on GPU.
+- Each adaptation-model evaluation re-encodes Raman spectra with the **exact** encoder
+  the evaluated LSTM was trained with (see §6) — mixing encoders across seeds silently
+  inflates test RMSE by 10–100x without raising an error, so always double-check
+  `--cvae-ckpt`/`--cvae-scaler` (or let `run_seeds.py` resolve them automatically).
 
 ---
 
-*Internal project -- ReaKt / Genopole. Not for redistribution.*
+*Internal project — ReaKt / Genopole. Not for redistribution.*

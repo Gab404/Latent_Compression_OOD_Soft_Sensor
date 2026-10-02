@@ -31,6 +31,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import sys
@@ -39,6 +40,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from src.latent_norm import apply_latent_norm, LatentNormScaler
 
 warnings.filterwarnings("ignore")
 
@@ -105,6 +108,8 @@ MODEL_NAMES = [
     "beta_vae_latent_lp_pi_lstm",
     "beta_vae_mamba",
     "beta_vae_liquid",
+    "beta_vae_light_fixed_pi_lstm",
+    "beta_vae_light_annealed_pi_lstm",
 ]
 
 
@@ -235,6 +240,98 @@ def _maybe_build_raman_encoder(cfg, device: torch.device):
     )
 
 
+
+# ── Rotation experiment (latent space, post-scaling) ─────────────────────────
+
+class PostScalingRotationWrapper(torch.nn.Module):
+    """
+    Enveloppe le modèle PI-LSTM et applique une transformation orthogonale
+    aux 64 latents MinMax-scalés, juste avant le LSTM.
+
+    Modes : identity | full | control | targeted
+    La matrice Q est générée avec un générateur LOCAL : le RNG global
+    (init du LSTM, ordre des batchs) est identique quel que soit le mode.
+    """
+
+    def __init__(self, base_model, mode, r_seed,
+                 dead_dims=None, pen_dim=None, glc_dim=None):
+        super().__init__()
+        self.base_model = base_model
+        self.mode = mode
+        self.n_calls = 0
+        g = torch.Generator().manual_seed(int(r_seed))
+        if mode == "full":
+            H = torch.randn(64, 64, generator=g)
+        elif mode == "control":
+            self.dims = [int(d) for d in dead_dims]
+            H = torch.randn(len(self.dims), len(self.dims), generator=g)
+        if mode in ("full", "control"):
+            Q, R = torch.linalg.qr(H)
+            self.register_buffer("Q", Q * torch.sign(torch.diag(R)))
+        if mode == "targeted":
+            self.d1, self.d2 = int(pen_dim), int(glc_dim)
+            self.c = self.s = math.sqrt(0.5)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name == "base_model":
+                raise
+            return getattr(self.base_model, name)   # k_prod, physics_parameters(), ...
+
+    def forward(self, x, *a, **k):
+        self.n_calls += 1
+        if self.mode != "identity":
+            x = x.clone()
+            if self.mode == "full":
+                x = (x @ self.Q).to(x.dtype)
+            elif self.mode == "control":
+                x[:, :, self.dims] = (x[:, :, self.dims] @ self.Q).to(x.dtype)
+            elif self.mode == "targeted":
+                v1 = x[:, :, self.d1].clone()
+                v2 = x[:, :, self.d2].clone()
+                x[:, :, self.d1] = self.c * v1 - self.s * v2
+                x[:, :, self.d2] = self.s * v1 + self.c * v2
+        return self.base_model(x, *a, **k)
+
+
+def _latent_dims_for_rotation(train_b, n_dead: int = 10):
+    """
+    Identifie, pour l'encodeur de CE seed, les dimensions mortes,
+    l'axe pénicilline et l'axe glucose (index 0-based = colonnes _raman_i).
+    """
+    from src.data.dataset import TARGET_COLS
+    cols = [f"_raman_{i}" for i in range(64)]
+    Z = np.vstack([b[cols].values for b in train_b])
+    P = np.concatenate([b[TARGET_COLS[1]].values for b in train_b])
+    S = np.concatenate([b["Substrate concentration(S:g/L)"].values for b in train_b])
+
+    std = Z.std(axis=0)
+    active = np.where(std > 0.05 * std.max())[0]
+    dead = np.argsort(std)[:n_dead]
+
+    def abs_corr(y):
+        out = np.zeros(64)
+        for j in range(64):
+            if std[j] > 0:
+                out[j] = abs(np.corrcoef(Z[:, j], y)[0, 1])
+        return np.nan_to_num(out)
+
+    cP = abs_corr(P)
+    pen_dim = int(np.argmax(cP))
+    cS = abs_corr(S)
+    cS[pen_dim] = 0.0
+    glc_dim = int(np.argmax(cS))
+
+    print(f"  [ROTATION] active dims ({len(active)}) : {active.tolist()}")
+    print(f"  [ROTATION] dead dims   : {sorted(dead.tolist())}")
+    print(f"  [ROTATION] pen axis    : _raman_{pen_dim}  (|r|={cP[pen_dim]:.3f})")
+    print(f"  [ROTATION] glc axis    : _raman_{glc_dim}  (|r|={cS[glc_dim]:.3f})")
+    if set(dead.tolist()) & set(active.tolist()):
+        print("  [ROTATION] WARNING : une dim 'morte' est aussi classée active")
+    return dead.tolist(), pen_dim, glc_dim
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -301,6 +398,16 @@ def main() -> None:
         "--raman-scaler", default=None, dest="raman_scaler",
         help="Override the Raman encoder scaler path from config.",
     )
+    parser.add_argument("--rotate-mode", type=str, choices=["identity", "full", "control", "targeted"], default=None,
+                        help="Expérience de rotation post-scaling (full, control, ou targeted).")
+    parser.add_argument("--rotate-seed", type=int, default=42, 
+                        help="Seed pour la génération de la matrice de rotation Q.")
+    parser.add_argument("--lstm-seed", type=int, default=None, dest="lstm_seed",
+                        help="Re-fixe le seed torch juste avant fit() (init LSTM + ordre des batchs).")
+    parser.add_argument("--latent-norm", default="minmax", dest="latent_norm", choices=["minmax", "global", "active"],
+                        help="Normalisation des latents en entrée du LSTM.")
+    parser.add_argument("--active-tol", type=float, default=0.05, dest="active_tol",
+                        help="Mode active : seuil relatif d'écart type.")
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -316,8 +423,18 @@ def main() -> None:
 
     # ── Config ────────────────────────────────────────────────────────────────
     from src.config import Config
-    cfg_path = Path(args.config) if args.config else _resolve_config_path(args.model)
+    
+    # 1. On crée un alias : le 'light' utilise la configuration et l'algorithme du beta_vae standard
+    model_alias = "beta_vae_pi_lstm" if "beta_vae_light" in args.model else args.model
+
+    cfg_path = Path(args.config) if args.config else _resolve_config_path(model_alias)
     cfg = Config.from_yaml(cfg_path)
+    
+    # 2. Mais pour charger les poids, on force le wrapper CVAE et on corrige les chemins par défaut
+    if "beta_vae_light" in args.model:
+        cfg.data["raman_encoder_type"] = "cvae_v2"
+        cfg.data["raman_ckpt"] = "./checkpoints/cvae_best.pt"
+        cfg.data["raman_scaler"] = "./checkpoints/cvae_scaler.joblib"
 
     # Command-line overrides
     if args.epochs is not None:
@@ -376,15 +493,44 @@ def main() -> None:
     # ── Algorithm ────────────────────────────────────────────────────────────
     print(f"\n[2] Initialising algorithm '{args.model}' ...")
     from src.algorithms import get_algorithm
-    AlgoCls = get_algorithm(args.model)
+    AlgoCls = get_algorithm(model_alias)
     alg     = AlgoCls(cfg, device)
+    if args.rotate_mode is not None:
+        dead_dims, pen_dim, glc_dim = _latent_dims_for_rotation(train_b)
+        print(f"  [ROTATION] mode={args.rotate_mode}  Q-seed={args.rotate_seed}")
+        _orig_build = alg._build_model
+
+        def _build_rotated():
+            return PostScalingRotationWrapper(
+                _orig_build(), args.rotate_mode, args.rotate_seed,
+                dead_dims=dead_dims, pen_dim=pen_dim, glc_dim=glc_dim,
+            )
+
+        # fit() reconstruit le modèle : on enveloppe donc à la construction
+        alg._build_model = _build_rotated
 
     # ── Train ────────────────────────────────────────────────────────────────
     print("\n[3] Training ...")
     if args.no_early_stopping:
         cfg.training.es_patience = int(cfg.training.n_epochs) + 1
         print(f"  [no-early-stopping] es_patience set to {cfg.training.es_patience}")
+
+    if args.lstm_seed is not None:
+        _set_seed(args.lstm_seed)
+        print(f"[LSTM SEED] seed torch refixé à {args.lstm_seed} avant fit()")
+
+    apply_latent_norm(alg, args.latent_norm, args.active_tol)
+
     history = alg.fit(train_b, val_b, verbose=True)
+
+    if args.latent_norm != "minmax":
+        assert isinstance(alg.scalers.feat, LatentNormScaler), "normalisation non appliquée."
+
+    if args.rotate_mode is not None:
+        assert isinstance(alg.model, PostScalingRotationWrapper), \
+            "ÉCHEC : le wrapper n'est plus en place après fit()"
+        assert alg.model.n_calls > 0, "ÉCHEC : la rotation n'a jamais été appliquée"
+        print(f"  [ROTATION] OK : wrapper actif, {alg.model.n_calls} forward passes")
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     print("\n[4] Evaluating ...")

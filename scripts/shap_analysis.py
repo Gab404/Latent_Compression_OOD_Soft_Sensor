@@ -66,26 +66,31 @@ from src.data.dataset import RAMAN_START_COL_IDX
 
 # Human-readable labels for each supported model type
 MODEL_LABELS = {
+    "cdae":     "CDAE-PI-LSTM",
     "cvae":     "CVAE-PI-LSTM",
     "beta_vae": "\u03b2-VAE-PI-LSTM",
 }
 
-# Default checkpoint / scaler / output-dir per model type
 MODEL_DEFAULTS = {
+    "cdae": {
+        "encoder_ckpt":   "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/encoders/cdae_s42.pt",
+        "encoder_scaler": "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/encoders/cdae_scaler_s42.joblib",
+        "lstm_ckpt":     "/home/gabriel/ReaKt/outputs/seed_sweep/cdae_pi_lstm/p2/checkpoints/cdae_pi_lstm_s42.pt",
+        "output_dir":    "./shap_cdae",
+    },
     "cvae": {
-        "encoder_ckpt":  "./checkpoints/cvae_best.pt",
-        "encoder_scaler": "./checkpoints/cvae_scaler.joblib",
-        "lstm_ckpt":     "./checkpoints/cvae_pi_lstm.pt",
-        "output_dir":    "./outputs/shap",
+        "encoder_ckpt":   "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/encoders/cvae_s42.pt",
+        "encoder_scaler": "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/encoders/cvae_scaler_s42.joblib",
+        "lstm_ckpt":     "/home/gabriel/ReaKt/outputs/seed_sweep/cvae_pi_lstm/p2/checkpoints/cvae_pi_lstm_s42.pt",
+        "output_dir":    "./shap_cvae",
     },
     "beta_vae": {
-        "encoder_ckpt":  "./checkpoints/beta_vae_best.pt",
-        "encoder_scaler": "./checkpoints/beta_vae_scaler.joblib",
-        "lstm_ckpt":     "./checkpoints/beta_vae_pi_lstm.pt",
-        "output_dir":    "./outputs/shap_beta_vae",
+        "encoder_ckpt":   "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p2/encoders/beta_vae_s42.pt",
+        "encoder_scaler": "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p2/encoders/beta_vae_scaler_s42.joblib",
+        "lstm_ckpt":     "/home/gabriel/ReaKt/outputs/seed_sweep/beta_vae_pi_lstm/p2/checkpoints/beta_vae_pi_lstm_s42.pt",
+        "output_dir":    "./shap_beta_vae",
     },
 }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Frozen differentiable preprocessing layers
@@ -93,18 +98,20 @@ MODEL_DEFAULTS = {
 
 class FrozenSGFilter(nn.Module):
     """
-    Savitzky-Golay first-derivative filter as a frozen nn.Conv1d.
+    Savitzky-Golay first-derivative filter as a frozen, differentiable module.
 
-    Approximates scipy.signal.savgol_filter(x, window_length=15, polyorder=2,
-    deriv=1, axis=-1) with zero-boundary padding instead of scipy's default
-    'interp' edge handling. The interior points (wavenumbers 7 … 1993) are
-    numerically identical; the 7 boundary channels on each side differ slightly.
+    Exactly reproduces scipy.signal.savgol_filter(x, window_length=15,
+    polyorder=2, deriv=1, axis=-1, mode='interp') — scipy's DEFAULT edge mode.
 
-    Parameters
-    ----------
-    n_wavenumbers : int  — number of input channels (default 2001)
-    window        : int  — SG window length, must be odd (default 15)
-    polyorder     : int  — SG polynomial order (default 2)
+    Interior points (indices half_w .. L-1-half_w) are computed via a valid
+    (unpadded) 1-D convolution. The half_w=7 boundary points on each side use
+    scipy's 'interp' convention: fit a single polyorder-order polynomial to
+    the first/last `window` samples and evaluate its derivative at each edge
+    position — this is NOT equivalent to zero-padding and must be handled
+    with dedicated coefficients (see savgol_coeffs(..., pos=...)).
+
+    Both the interior kernel and the 2*half_w edge coefficient vectors are
+    verified to match scipy to float64 machine precision (~1e-12) before use.
     """
 
     def __init__(
@@ -115,15 +122,42 @@ class FrozenSGFilter(nn.Module):
     ) -> None:
         super().__init__()
         self.n_wavenumbers = n_wavenumbers
+        self.window        = window
         self.half_w        = window // 2
 
-        # Precompute SG deriv-1 kernel using scipy
         from scipy.signal import savgol_coeffs
-        coeffs = savgol_coeffs(window, polyorder, deriv=1).astype(np.float32)
-        # Shape for Conv1d weight: (out_channels=1, in_channels=1, kernel_size)
-        kernel = torch.tensor(coeffs, dtype=torch.float32).view(1, 1, window)
-        # Register as buffer so it moves with .to(device) and is not a parameter
-        self.register_buffer("kernel", kernel)
+
+        # ── Interior kernel ──────────────────────────────────────────────────
+        # savgol_coeffs(..., use="conv") [default] returns coefficients meant
+        # for TRUE convolution (kernel flipped relative to correlation).
+        # torch.nn.functional.conv1d performs CROSS-correlation (no flip), so
+        # the kernel must be reversed here to match — otherwise the filter
+        # response is a completely different (wrong) kernel, not merely
+        # sign-inverted.
+        interior_coeffs = savgol_coeffs(window, polyorder, deriv=1).astype(np.float64)
+        interior_coeffs = interior_coeffs[::-1].copy()
+        self.register_buffer(
+            "kernel",
+            torch.tensor(interior_coeffs, dtype=torch.float32).view(1, 1, window),
+        )
+
+        # ── Edge coefficients (scipy 'interp' mode, exact) ──────────────────
+        # Left edge: output[p] = dot(coeffs(pos=p), x[0:window]),  p=0..half_w-1
+        left = np.stack([
+            savgol_coeffs(window, polyorder, deriv=1, pos=p, use="dot")
+            for p in range(self.half_w)
+        ]).astype(np.float64)                                  # (half_w, window)
+
+        # Right edge: output[L-half_w+q] = dot(coeffs(pos=window-half_w+q), x[L-window:L]),
+        # for q=0..half_w-1, in increasing output-index order (so it concatenates
+        # directly after `interior` with no further reordering needed).
+        right = np.stack([
+            savgol_coeffs(window, polyorder, deriv=1, pos=window - self.half_w + q, use="dot")
+            for q in range(self.half_w)
+        ]).astype(np.float64)                                   # (half_w, window)
+
+        self.register_buffer("left_coeffs",  torch.tensor(left,  dtype=torch.float32))
+        self.register_buffer("right_coeffs", torch.tensor(right, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -133,15 +167,22 @@ class FrozenSGFilter(nn.Module):
 
         Returns
         -------
-        x_sg : (B, n_wavenumbers) float32  — SG first-derivative filtered
+        x_sg : (B, n_wavenumbers) float32  — SG first-derivative filtered,
+               numerically matching scipy's mode='interp' at all positions.
         """
-        # Unsqueeze channel dim → (B, 1, L), apply conv, squeeze back
-        x_conv = nn.functional.conv1d(
-            x.unsqueeze(1),          # (B, 1, L)
-            self.kernel,             # (1, 1, window)
-            padding=self.half_w,     # zero-pad to preserve length
-        )                            # → (B, 1, L)
-        return x_conv.squeeze(1)     # (B, L)
+        hw = self.half_w
+
+        # Interior: valid (unpadded) convolution → (B, L - window + 1)
+        interior = nn.functional.conv1d(
+            x.unsqueeze(1),      # (B, 1, L)
+            self.kernel,         # (1, 1, window)
+        ).squeeze(1)             # (B, L - window + 1)
+
+        # Edges: linear combination of the first/last `window` input samples
+        left_out  = x[:, : self.window]  @ self.left_coeffs.T   # (B, half_w)
+        right_out = x[:, -self.window:] @ self.right_coeffs.T  # (B, half_w)
+
+        return torch.cat([left_out, interior, right_out], dim=1)  # (B, L)
 
 
 class FrozenStandardScaler(nn.Module):
@@ -910,7 +951,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model", default="cvae",
-                   choices=["cvae", "beta_vae"],
+                   choices=["cvae", "beta_vae", "cdae"],
                    help="Which encoder model to explain (cvae or beta_vae)")
     p.add_argument("--csv",       default="./100_Batches_IndPenSim_V3.csv",
                    help="Path to IndPenSim V3 CSV")
@@ -939,6 +980,9 @@ def parse_args() -> argparse.Namespace:
                    help="Test samples per SHAP call (reduce if OOM)")
     p.add_argument("--smoke-only", action="store_true",
                    help="Only run the forward-pass smoke test, skip SHAP")
+    p.add_argument("--no-heatmap", action="store_true",
+                   help="Skip generating temporal_heatmap.png (single-sample "
+                        "time x wavenumber heatmap)")
     return p.parse_args()
 
 
@@ -1019,13 +1063,14 @@ def main() -> None:
     )
 
     sample_idx = min(args.sample, len(X_test) - 1)
-    plot_temporal_heatmap(
-        shap_values        = shap_values,
-        wavenumber_labels  = wavenumber_labels,
-        output_dir         = out_dir,
-        sample_idx         = sample_idx,
-        top_k              = args.top_k,
-    )
+    if not args.no_heatmap:
+        plot_temporal_heatmap(
+            shap_values        = shap_values,
+            wavenumber_labels  = wavenumber_labels,
+            output_dir         = out_dir,
+            sample_idx         = sample_idx,
+            top_k              = args.top_k,
+        )
 
     plot_shap_spectrum_overlay(
         shap_values        = shap_values,

@@ -43,6 +43,7 @@ def _trim_system_memory() -> None:
     except Exception:
         pass  # non-Linux or libc not available — silently skip
 
+
 # ── Column definitions ────────────────────────────────────────────────────────
 
 PROCESS_FEATURE_COLS: List[str] = [
@@ -71,6 +72,7 @@ PROCESS_FEATURE_COLS: List[str] = [
     "Carbon evolution rate(CER:g/h)",
 ]
 
+# Les cibles augmentées pour le calcul du SAP Score
 TARGET_COLS: List[str] = [
     "Offline Biomass concentratio(X_offline:X(g L^{-1}))",
     "Offline Penicillin concentration(P_offline:P(g L^{-1}))",
@@ -154,9 +156,8 @@ class PenicillinDataModule:
                 df[col] = latents[:, i]
 
             # ── Free ~2 GB of raw Raman channels immediately ──────────────────
-            # The 2200 raw wavenumber columns are no longer needed after encoding.
-            # Dropping them now — before the per-batch .copy() loop — prevents
-            # each batch slice from carrying ~22 MB of redundant Raman data.
+            # The raw wavenumber columns are no longer needed after encoding.
+            # Dropping them now prevents each batch slice from carrying redundant data.
             _keep = set(PROCESS_FEATURE_COLS + TARGET_COLS + [FAULT_COL]
                         + self._raman_latent_cols)
             _drop = [c for c in df.columns if c not in _keep]
@@ -198,8 +199,7 @@ class PenicillinDataModule:
             # Forward-fill Raman latents (first ~10 rows have zero Raman signal).
             # We only replace rows where ALL latent columns are exactly 0 — these
             # are the rows where the encoder received no input spectrum and returned
-            # an all-zero vector.  Replacing individual-column zeros would corrupt
-            # V4/V5 features whose ReLU activations legitimately produce zeros.
+            # an all-zero vector.
             if use_raman and self._raman_latent_cols:
                 raman_vals   = b[self._raman_latent_cols].values
                 no_signal    = (raman_vals == 0).all(axis=1)  # rows with no Raman input

@@ -578,6 +578,7 @@ def train_beta_vae(
     device:          str   = "cuda",
     use_amp:         bool  = False,
     regime_ablation: bool  = False,
+    light_architecture: bool = False,
 ) -> None:
     """Train BetaVAE_Raman with β annealing and save checkpoint + scaler."""
     torch.manual_seed(seed)
@@ -618,10 +619,12 @@ def train_beta_vae(
     X_train, X_val, scaler = preprocess(X_train_raw, X_val_raw)
     dl_train, dl_val       = make_dataloaders(X_train, X_val, batch_size, dev)
 
-    model = BetaVAE_Raman(
-        input_length=N_RAMAN_COLS,
-        latent_dim=latent_dim,
-    ).to(dev)
+    if light_architecture:
+        from src.autoencoder.model import CVAE_Raman
+        print(" ⚠️ Utilisation de l'architecture légère (3 Conv, ReLU)")
+        model = CVAE_Raman(input_length=N_RAMAN_COLS, latent_dim=latent_dim).to(dev)
+    else:
+        model = BetaVAE_Raman(input_length=N_RAMAN_COLS, latent_dim=latent_dim).to(dev)
 
     optim   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -743,7 +746,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train CDAE, CVAE, or β-VAE Raman autoencoder on IndPenSim V3"
     )
-    parser.add_argument("--model",       choices=["cdae", "cvae", "beta_vae"],
+    parser.add_argument("--model",       choices=["cdae", "cvae", "beta_vae", "beta_vae_light"],
                         default="cdae",
                         help="Which autoencoder to train (default: cdae)")
     parser.add_argument("--csv",         default="./100_Batches_IndPenSim_V3.csv",
@@ -816,7 +819,7 @@ def main() -> None:
             device      = args.device,
             regime_ablation = args.regime_ablation,
         )
-    else:  # beta_vae
+    elif args.model == "beta_vae":
         ckpt_out   = args.ckpt   or "./checkpoints/beta_vae_best.pt"
         scaler_out = args.scaler or "./checkpoints/beta_vae_scaler.joblib"
         train_beta_vae(
@@ -837,6 +840,30 @@ def main() -> None:
             device          = args.device,
             use_amp         = args.amp,
             regime_ablation = args.regime_ablation,
+            light_architecture = False,
+        )
+    elif args.model == "beta_vae_light":
+        ckpt_out   = args.ckpt   or "./checkpoints/beta_vae_light_best.pt"
+        scaler_out = args.scaler or "./checkpoints/beta_vae_light_scaler.joblib"
+        train_beta_vae(
+            csv_path        = args.csv,
+            ckpt_out        = ckpt_out,
+            scaler_out      = scaler_out,
+            latent_dim      = args.latent_dim,
+            max_beta        = args.max_beta,
+            anneal_schedule = args.anneal_schedule,
+            anneal_epochs   = args.anneal_epochs,
+            anneal_delay    = args.anneal_delay,
+            n_cycles        = args.n_cycles,
+            n_epochs        = args.epochs,
+            batch_size      = args.batch_size,
+            lr              = args.lr,
+            weight_decay    = args.weight_decay,
+            seed            = args.seed,
+            device          = args.device,
+            use_amp         = args.amp,
+            regime_ablation = args.regime_ablation,
+            light_architecture = True,
         )
 
 
