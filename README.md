@@ -1,4 +1,4 @@
-# ReaKt-v2 — Penicillin Soft-Sensor Benchmark
+# Penicillin Soft-Sensor Benchmark
 
 Benchmark comparing model architectures as soft-sensors for online penicillin prediction
 from Raman spectra on **IndPenSim V3** (100 batches, 2,001 Raman channels).
