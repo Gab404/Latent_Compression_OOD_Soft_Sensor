@@ -1,0 +1,20 @@
+{
+  "title": "indpensim-bench: A Reproducible Benchmark for Fault-Tolerant Raman Soft Sensing in Penicillin Fermentation",
+  "upload_type": "software",
+  "description": "Open-source Python benchmark suite for evaluating machine learning and deep learning soft sensors on simulated industrial penicillin fermentation data (IndPenSim) under sensor faults and out-of-distribution regimes.",
+  "creators": [
+    {
+      "name": "Guiet-Dupré, Gabriel",
+      "affiliation": "LyRIDS Lab, ECE Paris"
+    }
+  ],
+  "keywords": [
+    "Soft Sensing",
+    "Raman Spectroscopy",
+    "Penicillin Fermentation",
+    "Bioprocess Engineering",
+    "Machine Learning Benchmark",
+    "IndPenSim"
+  ],
+  "license": "Apache-2.0"
+}
