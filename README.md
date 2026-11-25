@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/1252657834.svg)](https://doi.org/10.5281/zenodo.24544535)
 # Penicillin Soft-Sensor Benchmark
 
 Benchmark comparing model architectures as soft-sensors for online penicillin prediction
